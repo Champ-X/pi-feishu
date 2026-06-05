@@ -22,6 +22,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   ExtensionCommandContext,
+  TurnEndEvent,
   AgentEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { Static } from "typebox";
@@ -190,38 +191,41 @@ export default function (pi: ExtensionAPI) {
 
   // ─── 监听 Pi 响应 → 回传给元宝 ───
 
-  // Agent 循环结束（一次用户消息可能触发多轮 turn：思考→工具→再思考→最终回复）
-  // 必须在 agent_end 时发送，否则只会发送第一轮的部分思考内容
-  pi.on("agent_end", (event: AgentEndEvent) => {
+  // 每轮 Turn 结束 → 推送到手机（每轮思考/回复都会实时推送）
+  pi.on("turn_end", (event: TurnEndEvent) => {
     if (!client || client.getStatus() !== "connected") return;
 
     const chatId = findActiveChatId();
     if (!chatId) return;
 
+    // 只处理 assistant 消息（跳过 tool_result 等）
+    if (event.message?.role !== "assistant") return;
+
+    const textContent = extractTextFromMessage(event.message);
+    if (!textContent) return;
+
     const pending = pendingTurns.get(chatId);
     const replyToMsgId = pending?.msgId;
 
-    // 从所有消息中提取最后一条 assistant 消息的文本
-    const lastAssistantText = extractLastAssistantText(event.messages);
-    if (!lastAssistantText) {
-      // 没有文本内容，停止 heartbeat 并清理
-      client.stopReplyHeartbeat(chatId);
-      pendingTurns.delete(chatId);
-      return;
-    }
-
-    // 停止 reply heartbeat
-    client.stopReplyHeartbeat(chatId);
-
-    // 清除该 chat 的 pending turn
-    pendingTurns.delete(chatId);
-
-    // 分块发送（元宝单条消息限制 4000 字符）
-    const chunks = chunkText(lastAssistantText, MAX_TEXT_CHUNK);
+    // 分块发送
+    const chunks = chunkText(textContent, MAX_TEXT_CHUNK);
     for (const chunk of chunks) {
       client.sendMessage(chatId, chunk, replyToMsgId || undefined);
     }
-    flashStatus(`元宝: ✅ 已回复 (${lastAssistantText.length}字)`);
+    flashStatus(`元宝: 📤 推送中 (${textContent.length}字)`);
+  });
+
+  // Agent 循环结束 → 停止 heartbeat，清理状态
+  pi.on("agent_end", (event: AgentEndEvent) => {
+    const chatId = findActiveChatId();
+    if (!chatId) return;
+
+    // 停止 reply heartbeat
+    client?.stopReplyHeartbeat(chatId);
+
+    // 清除该 chat 的 pending turn
+    pendingTurns.delete(chatId);
+    flashStatus(`元宝: ✅ 完成`);
   });
 
   /**
