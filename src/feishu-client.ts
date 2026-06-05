@@ -647,24 +647,26 @@ export class FeishuClient {
 
   // ─── 交互卡片构建 ──────────────────────────────────────
 
-  /** 构建一个简单的流式更新卡片（schema 2.0） */
+  /** 构建一个简单的流式更新卡片（v1 格式） */
   static buildStreamingCard(text: string, status?: string): Record<string, unknown> {
     const elements: Record<string, unknown>[] = [];
 
     if (status) {
       elements.push({
         tag: "div",
-        text: { tag: "plain_text", content: status },
+        text: { tag: "lark_md", content: `**${status}**` },
       });
     }
 
+    // 截断过长文本，避免卡片内容超限
+    const safeText = text.length > 3500 ? text.substring(0, 3500) + "\n..." : text;
+
     elements.push({
-      tag: "markdown",
-      content: text,
+      tag: "div",
+      text: { tag: "lark_md", content: safeText },
     });
 
     return {
-      schema: "2.0",
       config: { wide_screen_mode: true },
       elements,
     };
@@ -672,13 +674,14 @@ export class FeishuClient {
 
   /** 构建完成态卡片 */
   static buildFinalCard(text: string): Record<string, unknown> {
+    const safeText = text.length > 3500 ? text.substring(0, 3500) + "\n..." : text;
+
     return {
-      schema: "2.0",
       config: { wide_screen_mode: true },
       elements: [
         {
-          tag: "markdown",
-          content: text,
+          tag: "div",
+          text: { tag: "lark_md", content: safeText },
         },
       ],
     };
