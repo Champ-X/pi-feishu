@@ -10,16 +10,15 @@
  * 4. 媒体收发：下载图片/文件 → 上传到 Pi，Pi 生成的图片/文件 → 上传到飞书
  * 5. Reaction 输入指示：处理中显示 Typing，失败显示 CrossMark
  * 6. 工具进度：每个工具调用都实时推送到飞书（可编辑卡片）
- * 7. 流式输出：message_update 事件实时更新卡片内容
- * 8. 中间文本：assistant 思考过程中的文本也推送到飞书
- * 9. 注册 /feishu 命令管理连接状态
+ * 7. 中间文本：assistant 思考过程中的文本也推送到飞书
+ * 8. 注册 /feishu 命令管理连接状态
  *
  * 消息流程（参考 hermes-agent）：
  *
  *   用户消息 →
  *     [Typing Reaction] →
- *     tool_execution_start → [进度卡片: 🔧 bash...] →
- *     tool_execution_end   → [进度卡片: 🔧 bash ✓] →
+ *     tool_execution_start → [进度卡片: ⏳ Shell...] →
+ *     tool_execution_end   → [进度卡片: ✅ Shell] →
  *     turn_end (text+toolCalls) → [中间文本: "让我查找..."] →
  *     ... 下一轮工具 ... →
  *     turn_end (text only) → [最终回复] →
@@ -50,9 +49,6 @@ import type { FeishuConfig } from "./types.js";
 
 /** 飞书 post 消息单条最大字符数（约 4000） */
 const MAX_TEXT_CHUNK = 4000;
-
-/** 流式卡片更新节流间隔（毫秒） */
-const STREAM_THROTTLE_MS = 1500;
 
 /** 工具名到友好名称的映射 */
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
@@ -128,16 +124,6 @@ interface ChatState {
   progressMsgId: string | null;
   /** 工具执行记录 */
   toolEntries: Array<{ name: string; status: "running" | "done" | "error" }>;
-
-  // ── 流式输出追踪 ──
-  /** 流式卡片消息 ID */
-  streamMsgId: string | null;
-  /** 流式累积文本 */
-  streamText: string;
-  /** 最后一次流式卡片更新时间 */
-  lastStreamUpdate: number;
-  /** 是否已经通过流式推送了最终文本 */
-  alreadyStreamed: boolean;
 }
 
 // ─── 扩展入口 ───────────────────────────────────────────
@@ -263,10 +249,6 @@ export default function (pi: ExtensionAPI) {
       userMsgId: msgId,
       progressMsgId: null,
       toolEntries: [],
-      streamMsgId: null,
-      streamText: "",
-      lastStreamUpdate: 0,
-      alreadyStreamed: false,
     });
 
     // 添加 Typing Reaction
@@ -278,7 +260,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ═══════════════════════════════════════════════════════
-  //  Pi 事件处理 — 工具进度 + 流式输出 + 回复
+  //  Pi 事件处理 — 工具进度 + 文本回复
   // ═══════════════════════════════════════════════════════
 
   // ─── tool_execution_start → 更新进度卡片 ──────────────
@@ -316,50 +298,6 @@ export default function (pi: ExtensionAPI) {
     updateProgressCard(state);
   });
 
-  // ─── message_update → 流式文本推送 ────────────────────
-
-  pi.on("message_update", (event: any) => {
-    if (!client || client.getStatus() !== "connected") return;
-    const state = findActiveState();
-    if (!state) return;
-
-    // 只处理 assistant 消息的文本更新
-    const message = event.message;
-    if (!message || message.role !== "assistant") return;
-
-    // 提取当前累积的文本
-    const text = extractTextFromMessage(message);
-    if (!text) return;
-
-    // 如果文本发生了变化，更新流式卡片
-    if (text === state.streamText) return;
-    state.streamText = text;
-
-    const now = Date.now();
-
-    // 首次有文本 → 创建流式卡片
-    if (!state.streamMsgId) {
-      const card = FeishuClient.buildStreamingCard(text, "⏳ 生成中...");
-      client.sendCard(state.chatId, card, state.userMsgId).then((cardMsgId) => {
-        if (cardMsgId) {
-          state.streamMsgId = cardMsgId;
-          state.lastStreamUpdate = Date.now();
-        }
-      }).catch(() => {});
-      return;
-    }
-
-    // 节流更新
-    if (now - state.lastStreamUpdate < STREAM_THROTTLE_MS) return;
-
-    const card = FeishuClient.buildStreamingCard(text, "⏳ 生成中...");
-    client.updateCard(state.streamMsgId, card).then(() => {
-      state.lastStreamUpdate = Date.now();
-    }).catch(() => {
-      state.streamMsgId = null;
-    });
-  });
-
   // ─── turn_end → 发送中间/最终文本 ─────────────────────
 
   pi.on("turn_end", (event: TurnEndEvent) => {
@@ -376,39 +314,14 @@ export default function (pi: ExtensionAPI) {
     // 检查这一轮是否包含工具调用
     const hasToolCalls = message.content?.some((block: any) => block.type === "toolCall");
 
-    // 如果流式推送已经展示了文本，跳过 turn_end 的重复推送
-    if (state.alreadyStreamed && state.streamMsgId) {
-      // 流式卡片已经有内容了，只需确保最新文本已更新
-      if (textContent !== state.streamText) {
-        state.streamText = textContent;
-        const card = FeishuClient.buildStreamingCard(textContent, "⏳ 生成中...");
-        client.updateCard(state.streamMsgId, card).catch(() => {});
-      }
-      return;
-    }
-
-    // 标记流式已经开始推送
-    if (state.streamMsgId) {
-      state.alreadyStreamed = true;
-      // 更新流式卡片为最新文本
-      if (textContent !== state.streamText) {
-        state.streamText = textContent;
-        const card = FeishuClient.buildStreamingCard(textContent, "⏳ 生成中...");
-        client.updateCard(state.streamMsgId, card).catch(() => {});
-      }
-      return;
-    }
-
-    // ── 没有流式卡片，直接发送文本 ──
-
     if (hasToolCalls) {
-      // 中间轮：assistant 有文本 + 工具调用 → 发送中间文本
+      // 中间轮：assistant 有文本 + 工具调用 → 发送中间文本（回复到用户消息）
       const chunks = chunkText(textContent, MAX_TEXT_CHUNK);
       for (const chunk of chunks) {
         client.sendMessage(state.chatId, chunk, state.userMsgId);
       }
     } else {
-      // 最终轮（或无工具调用的单轮）→ 发送文本
+      // 最终轮（或无工具调用的单轮）→ 发送文本（新消息）
       const chunks = chunkText(textContent, MAX_TEXT_CHUNK);
       for (const chunk of chunks) {
         client.sendMessage(state.chatId, chunk);
@@ -418,18 +331,12 @@ export default function (pi: ExtensionAPI) {
     flashStatus(`飞书: 📤 推送中 (${textContent.length}字)`);
   });
 
-  // ─── agent_end → 最终化 ──────────────────────────────
+  // ─── agent_end → 清理 ────────────────────────────────
 
   pi.on("agent_end", (_event: AgentEndEvent) => {
     if (!client || client.getStatus() !== "connected") return;
     const state = findActiveState();
     if (!state) return;
-
-    // 最终化流式卡片（如果存在）
-    if (state.streamMsgId && state.streamText) {
-      const finalCard = FeishuClient.buildFinalCard(state.streamText);
-      client.updateCard(state.streamMsgId, finalCard).catch(() => {});
-    }
 
     // 移除 Typing Reaction
     client.stopTyping(state.chatId, true).catch(() => {});
