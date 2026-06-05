@@ -6,8 +6,11 @@
  * 功能：
  * 1. 通过飞书官方 Node.js SDK 连接飞书 WebSocket 长连接
  * 2. 接收飞书消息 → 转发为 Pi 用户消息
- * 3. 监听 Pi 响应 → 回传给飞书（回复/新消息）
- * 4. 注册 /feishu 命令管理连接状态
+ * 3. 监听 Pi 响应 → 回传给飞书（回复/新消息/交互卡片）
+ * 4. 媒体收发：下载图片/文件 → 上传到 Pi，Pi 生成的图片/文件 → 上传到飞书
+ * 5. Reaction 输入指示：处理中显示 Typing，失败显示 CrossMark
+ * 6. 流式卡片：长响应使用交互卡片实时更新
+ * 7. 注册 /feishu 命令管理连接状态
  *
  * 配置优先级（从高到低）：
  *   1. CLI 标志: --feishu-app-id, --feishu-app-secret 等
@@ -34,16 +37,23 @@ import type {
   AgentEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { Static } from "typebox";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, unlinkSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { FeishuClient } from "./feishu-client.js";
+import type { InboundResource } from "./feishu-client.js";
 import type { FeishuConfig } from "./types.js";
 
 // ─── 常量 ─────────────────────────────────────────────
 
 /** 飞书 post 消息单条最大字符数（约 4000） */
 const MAX_TEXT_CHUNK = 4000;
+
+/** 使用流式卡片的消息长度阈值（超过此值用卡片，否则普通文本） */
+const STREAMING_CARD_THRESHOLD = 800;
+
+/** 流式卡片更新间隔（毫秒） */
+const CARD_UPDATE_INTERVAL = 2000;
 
 // ─── 从 Pi settings.json 读取 feishu 配置段 ──────────────
 
@@ -105,6 +115,12 @@ export default function (pi: ExtensionAPI) {
   interface PendingTurn {
     chatId: string;
     msgId: string;
+    /** 流式卡片消息 ID（用于实时更新） */
+    cardMsgId: string | null;
+    /** 累积的响应文本（用于流式卡片） */
+    accumulatedText: string;
+    /** 最后一次卡片更新时间 */
+    lastCardUpdate: number;
   }
   const pendingTurns: Map<string, PendingTurn> = new Map();
 
@@ -175,8 +191,8 @@ export default function (pi: ExtensionAPI) {
     client = new FeishuClient(config);
 
     // 注册消息处理：飞书消息 → Pi 用户消息
-    client.setOnMessage((chatId, msgId, text, chatType) => {
-      handleFeishuMessage(chatId, msgId, text, chatType);
+    client.setOnMessage((chatId, msgId, text, chatType, resources) => {
+      handleFeishuMessage(chatId, msgId, text, chatType, resources);
     });
 
     // 注册状态变化处理
@@ -195,22 +211,47 @@ export default function (pi: ExtensionAPI) {
 
   // ─── 处理飞书消息 → 转发给 Pi ────────────────────────
 
-  function handleFeishuMessage(
+  async function handleFeishuMessage(
     chatId: string,
     msgId: string,
     text: string,
     _chatType: "p2p" | "group",
-  ): void {
+    resources: InboundResource[],
+  ): Promise<void> {
     const content = text.trim();
-    if (!content) return;
+    if (!content && resources.length === 0) return;
 
     flashStatus(`飞书: 📩 ${content.substring(0, 20)}${content.length > 20 ? "..." : ""}`);
 
-    // 记录该 chatId 对应的消息，用于后续回复
-    pendingTurns.set(chatId, { chatId, msgId });
+    // ─── Phase 2: 处理入站媒体资源 ──────────────────────
+    let resourceDescription = "";
+    for (const res of resources) {
+      const localPath = await client!.downloadResource(
+        msgId,
+        res.fileKey,
+        res.type,
+        res.fileName,
+      );
+      if (localPath) {
+        resourceDescription += `\n[收到${res.type === "image" ? "图片" : res.type === "audio" ? "语音" : res.type === "video" ? "视频" : "文件"}: ${localPath}]`;
+      }
+    }
 
-    // 发送给 Pi
-    pi.sendUserMessage(content);
+    // 记录该 chatId 对应的消息，用于后续回复
+    pendingTurns.set(chatId, {
+      chatId,
+      msgId,
+      cardMsgId: null,
+      accumulatedText: "",
+      lastCardUpdate: 0,
+    });
+
+    // ─── Phase 3: 添加 Typing Reaction ─────────────────
+    await client!.startTyping(chatId, msgId);
+
+    // 发送给 Pi（附加资源描述）
+    const fullContent = content + (resourceDescription ? "\n" + resourceDescription : "");
+    pi.sendUserMessage(fullContent);
   }
 
   // ─── 监听 Pi 响应 → 回传给飞书 ────────────────────────
@@ -231,23 +272,93 @@ export default function (pi: ExtensionAPI) {
     const pending = pendingTurns.get(chatId);
     const replyToMsgId = pending?.msgId;
 
-    // 分块发送
-    const chunks = chunkText(textContent, MAX_TEXT_CHUNK);
-    for (const chunk of chunks) {
-      client.sendMessage(chatId, chunk, replyToMsgId || undefined);
+    // 累积文本
+    if (pending) {
+      pending.accumulatedText += (pending.accumulatedText ? "\n\n" : "") + textContent;
     }
+
+    // ─── Phase 3: 流式卡片 vs 普通文本 ──────────────────
+    const accumulated = pending?.accumulatedText ?? textContent;
+
+    if (accumulated.length > STREAMING_CARD_THRESHOLD && pending) {
+      // 长响应：使用流式卡片
+      handleStreamingCard(chatId, pending, accumulated);
+    } else {
+      // 短响应：直接发文本
+      const chunks = chunkText(textContent, MAX_TEXT_CHUNK);
+      for (const chunk of chunks) {
+        client.sendMessage(chatId, chunk, replyToMsgId || undefined);
+      }
+    }
+
     flashStatus(`飞书: 📤 推送中 (${textContent.length}字)`);
   });
 
-  // Agent 循环结束 → 清理状态
+  // Agent 循环结束 → 最终化并发送完整响应
   pi.on("agent_end", (_event: AgentEndEvent) => {
+    if (!client || client.getStatus() !== "connected") return;
+
     const chatId = findActiveChatId();
     if (!chatId) return;
+
+    const pending = pendingTurns.get(chatId);
+
+    // ─── Phase 3: 最终化流式卡片 ────────────────────────
+    if (pending?.cardMsgId && pending.accumulatedText) {
+      const finalCard = FeishuClient.buildFinalCard(pending.accumulatedText);
+      client.updateCard(pending.cardMsgId, finalCard).catch(() => {});
+    }
+
+    // ─── Phase 3: 移除 Typing Reaction ─────────────────
+    client.stopTyping(chatId, true).catch(() => {});
 
     // 清除该 chat 的 pending turn
     pendingTurns.delete(chatId);
     flashStatus("飞书: ✅ 完成");
   });
+
+  // ─── 流式卡片处理 ──────────────────────────────────────
+
+  /**
+   * 处理流式卡片更新。
+   * 首次创建卡片，后续实时更新内容。
+   */
+  function handleStreamingCard(
+    chatId: string,
+    pending: PendingTurn,
+    text: string,
+  ): void {
+    if (!client) return;
+
+    const now = Date.now();
+
+    // 首次创建卡片
+    if (!pending.cardMsgId) {
+      const card = FeishuClient.buildStreamingCard(text, "🤔 思考中...");
+      const replyTo = pending.msgId || undefined;
+
+      client.sendCard(chatId, card, replyTo).then((cardMsgId) => {
+        if (cardMsgId) {
+          pending.cardMsgId = cardMsgId;
+          pending.lastCardUpdate = Date.now();
+        }
+      }).catch(() => {});
+
+      return;
+    }
+
+    // 节流：避免过于频繁更新卡片
+    if (now - pending.lastCardUpdate < CARD_UPDATE_INTERVAL) return;
+
+    // 更新现有卡片
+    const card = FeishuClient.buildStreamingCard(text, "⏳ 生成中...");
+    client.updateCard(pending.cardMsgId, card).then(() => {
+      pending.lastCardUpdate = Date.now();
+    }).catch(() => {
+      // 更新失败，可能消息被撤回，清除 cardMsgId
+      pending.cardMsgId = null;
+    });
+  }
 
   /**
    * 找到当前应该回复的 chatId。
@@ -378,6 +489,134 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text" as const, text: `已发送到飞书 [${chatId}]: ${message}` }],
         details: { sent: true, chatId, message } as Record<string, unknown>,
+      };
+    },
+  });
+
+  // ─── 注册自定义工具：发送图片到飞书 ────────────────────
+
+  const SendImageToFeishuParams = {
+    type: "object" as const,
+    properties: {
+      file_path: { type: "string" as const, description: "本地图片文件路径" },
+      chat_id: {
+        type: "string" as const,
+        description: "目标聊天 ID，留空则发送到最近活跃的聊天",
+      },
+    },
+    required: ["file_path"],
+  };
+
+  pi.registerTool({
+    name: "send_image_to_feishu",
+    label: "发送图片到飞书",
+    description: "将本地图片文件上传到飞书并发送。当需要发送图片到飞书聊天时使用。",
+    parameters: SendImageToFeishuParams,
+    async execute(
+      _toolCallId: string,
+      params: Static<typeof SendImageToFeishuParams>,
+      _signal: AbortSignal | undefined,
+      _onUpdate: any,
+      _ctx: ExtensionContext,
+    ) {
+      const filePath = params.file_path as string;
+      const chatId = (params.chat_id as string) || findActiveChatId();
+
+      if (!client || client.getStatus() !== "connected") {
+        return {
+          content: [
+            { type: "text" as const, text: "错误: 飞书 Bot 未连接。" },
+          ],
+          details: {} as Record<string, unknown>,
+        };
+      }
+
+      if (!chatId) {
+        return {
+          content: [
+            { type: "text" as const, text: "错误: 没有活跃的飞书聊天。" },
+          ],
+          details: {} as Record<string, unknown>,
+        };
+      }
+
+      const imageKey = await client.uploadImage(filePath);
+      if (!imageKey) {
+        return {
+          content: [{ type: "text" as const, text: "错误: 图片上传失败。" }],
+          details: {} as Record<string, unknown>,
+        };
+      }
+
+      await client.sendImage(chatId, imageKey);
+      return {
+        content: [{ type: "text" as const, text: `图片已发送到飞书 [${chatId}]: ${filePath}` }],
+        details: { sent: true, chatId, filePath, imageKey } as Record<string, unknown>,
+      };
+    },
+  });
+
+  // ─── 注册自定义工具：发送文件到飞书 ────────────────────
+
+  const SendFileToFeishuParams = {
+    type: "object" as const,
+    properties: {
+      file_path: { type: "string" as const, description: "本地文件路径" },
+      file_name: { type: "string" as const, description: "文件名" },
+      chat_id: {
+        type: "string" as const,
+        description: "目标聊天 ID，留空则发送到最近活跃的聊天",
+      },
+    },
+    required: ["file_path", "file_name"],
+  };
+
+  pi.registerTool({
+    name: "send_file_to_feishu",
+    label: "发送文件到飞书",
+    description: "将本地文件上传到飞书并发送。当需要发送文件到飞书聊天时使用。",
+    parameters: SendFileToFeishuParams,
+    async execute(
+      _toolCallId: string,
+      params: Static<typeof SendFileToFeishuParams>,
+      _signal: AbortSignal | undefined,
+      _onUpdate: any,
+      _ctx: ExtensionContext,
+    ) {
+      const filePath = params.file_path as string;
+      const fileName = params.file_name as string;
+      const chatId = (params.chat_id as string) || findActiveChatId();
+
+      if (!client || client.getStatus() !== "connected") {
+        return {
+          content: [
+            { type: "text" as const, text: "错误: 飞书 Bot 未连接。" },
+          ],
+          details: {} as Record<string, unknown>,
+        };
+      }
+
+      if (!chatId) {
+        return {
+          content: [
+            { type: "text" as const, text: "错误: 没有活跃的飞书聊天。" },
+          ],
+          details: {} as Record<string, unknown>,
+        };
+      }
+
+      const fileKey = await client.uploadFile(filePath, fileName);
+      if (!fileKey) {
+        return {
+          content: [{ type: "text" as const, text: "错误: 文件上传失败。" }],
+          details: {} as Record<string, unknown>,
+        };
+      }
+
+      await client.sendFile(chatId, fileKey);
+      return {
+        content: [{ type: "text" as const, text: `文件已发送到飞书 [${chatId}]: ${fileName}` }],
+        details: { sent: true, chatId, filePath, fileName, fileKey } as Record<string, unknown>,
       };
     },
   });
