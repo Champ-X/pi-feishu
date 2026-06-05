@@ -663,10 +663,18 @@ export default function (pi: ExtensionAPI) {
 
   /** 状态栏瞬态消息定时器 */
   let statusTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 当前状态栏显示的文本 */
+  let currentStatusText: string = "";
 
-  /** 更新状态栏显示 */
+  /** 更新状态栏显示（连接状态变化时调用） */
   function updateStatus(ctx: ExtensionContext | null, status: string): void {
     if (!ctx?.hasUI) return;
+
+    // 取消待恢复的 flash 定时器
+    if (statusTimer) {
+      clearTimeout(statusTimer);
+      statusTimer = null;
+    }
 
     const statusMap: Record<string, string> = {
       connecting: "飞书: 连接中",
@@ -676,24 +684,33 @@ export default function (pi: ExtensionAPI) {
     };
 
     const text = statusMap[status] ?? `飞书: ${status}`;
+    if (currentStatusText === text) return;
+    currentStatusText = text;
     ctx.ui.setStatus("feishu", text);
   }
 
   /**
    * 在状态栏显示瞬态消息。
-   * 5 秒后自动恢复为连接状态。
+   * 3 秒后自动恢复为连接状态。
    */
   function flashStatus(message: string): void {
     if (!ctxRef?.hasUI) return;
     if (statusTimer) clearTimeout(statusTimer);
+
+    if (currentStatusText === message) return;
+    currentStatusText = message;
     ctxRef.ui.setStatus("feishu", message);
 
     statusTimer = setTimeout(() => {
       statusTimer = null;
       if (client && client.getStatus() === "connected") {
-        ctxRef?.ui.setStatus("feishu", "飞书: 已连接");
+        const text = "飞书: 已连接";
+        if (currentStatusText !== text) {
+          currentStatusText = text;
+          ctxRef?.ui.setStatus("feishu", text);
+        }
       }
-    }, 5000);
+    }, 3000);
   }
 
   /**

@@ -154,6 +154,8 @@ export class FeishuClient {
           this.handleInboundMessage(data);
         },
         "im.message.message_read_v1": async () => {},
+        "im.message.reaction.created_v1": async () => {},
+        "im.message.reaction.deleted_v1": async () => {},
         "im.chat.member.bot.added_v1": async () => {},
         "im.chat.member.bot.deleted_v1": async () => {},
         "im.chat.access_event.bot_p2p_chat_entered_v1": async () => {},
