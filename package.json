@@ -1,28 +1,47 @@
 {
-  "name": "pi-yuanbao",
-  "version": "2.0.0",
-  "description": "Pi extension: Tencent Yuanbao Bot API integration for controlling Pi via Yuanbao",
+  "name": "pi-feishu",
+  "version": "1.0.0",
+  "description": "Pi extension: remote control Pi via Feishu (飞书) Bot API — WebSocket chat bridge using official Lark SDK",
   "type": "module",
   "main": "src/index.ts",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "feishu",
+    "lark",
+    "bot-api",
+    "chat-bridge",
+    "websocket"
+  ],
+  "files": [
+    "src/index.ts",
+    "src/feishu-client.ts",
+    "src/types.ts"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
   "scripts": {
-    "dev": "pi -e ./src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "npx tsx src/__tests__/proto.test.ts"
+    "prepublishOnly": "npm run typecheck"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "@larksuiteoapi/node-sdk": "^1.64.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.2",
-    "@types/ws": "^8.5.10",
     "typescript": "^5.5.0"
-  },
-  "keywords": [
-    "pi",
-    "extension",
-    "yuanbao",
-    "tencent",
-    "bot-api",
-    "openclaw"
-  ]
+  }
 }

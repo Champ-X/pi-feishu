@@ -1,21 +1,29 @@
 /**
- * Pi-Yuanbao 扩展主入口
+ * Pi-Feishu 扩展主入口
  *
- * 使用元宝官方 Bot API 将腾讯元宝作为聊天渠道控制 Pi。
+ * 使用飞书官方 Bot API（WebSocket 长连接）将飞书作为聊天渠道控制 Pi。
  *
  * 功能：
- * 1. 通过元宝官方 WebSocket Bot API 连接元宝
- * 2. 接收元宝消息 → 转发为 Pi 用户消息
- * 3. 监听 Pi 响应 → 回传给元宝
- * 4. 注册 /yuanbao 命令管理连接状态
+ * 1. 通过飞书官方 Node.js SDK 连接飞书 WebSocket 长连接
+ * 2. 接收飞书消息 → 转发为 Pi 用户消息
+ * 3. 监听 Pi 响应 → 回传给飞书（回复/新消息）
+ * 4. 注册 /feishu 命令管理连接状态
  *
- * 配置（通过环境变量或 CLI 标志）：
- *   YUANBAO_APP_ID      - 元宝 App Key
- *   YUANBAO_APP_SECRET   - 元宝 App Secret
- *   YUANBAO_BOT_ID       - Bot ID（可选）
- *   YUANBAO_WS_URL       - WebSocket 地址（可选）
- *   YUANBAO_API_DOMAIN   - API 域名（可选）
- *   YUANBAO_ROUTE_ENV    - 路由环境（可选）
+ * 配置优先级（从高到低）：
+ *   1. CLI 标志: --feishu-app-id, --feishu-app-secret 等
+ *   2. 环境变量: FEISHU_APP_ID, FEISHU_APP_SECRET 等
+ *   3. Pi settings.json 中的 feishu 字段
+ *
+ * settings.json 配置示例：
+ *   {
+ *     "feishu": {
+ *       "appId": "cli_xxx",
+ *       "appSecret": "xxx",
+ *       "domain": "feishu",
+ *       "encryptKey": "",
+ *       "verificationToken": ""
+ *     }
+ *   }
  */
 
 import type {
@@ -26,33 +34,68 @@ import type {
   AgentEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { Static } from "typebox";
-import { YuanbaoClient } from "./yuanbao-client.js";
-import type { IncomingMessage } from "./yuanbao-client.js";
-import type { YuanbaoConfig } from "./types.js";
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { FeishuClient } from "./feishu-client.js";
+import type { FeishuConfig } from "./types.js";
 
-// ─── 常量 ───
+// ─── 常量 ─────────────────────────────────────────────
 
-/** 元宝单条消息最大字符数 */
+/** 飞书 post 消息单条最大字符数（约 4000） */
 const MAX_TEXT_CHUNK = 4000;
 
-// ─── 默认配置 ───
+// ─── 从 Pi settings.json 读取 feishu 配置段 ──────────────
 
-function loadConfig(): YuanbaoConfig {
+/**
+ * 从 JSON 文件中读取 feishu 配置段。
+ * 文件不存在或解析失败时静默返回空对象。
+ */
+function readFeishuFromSettingsFile(filePath: string): Record<string, string> {
+  try {
+    if (!existsSync(filePath)) return {};
+    const raw = readFileSync(filePath, "utf-8");
+    const json = JSON.parse(raw);
+    const fs = json?.feishu;
+    if (!fs || typeof fs !== "object") return {};
+    return {
+      appId: fs.appId ?? fs.app_id ?? "",
+      appSecret: fs.appSecret ?? fs.app_secret ?? "",
+      domain: fs.domain ?? "",
+      encryptKey: fs.encryptKey ?? fs.encrypt_key ?? "",
+      verificationToken: fs.verificationToken ?? fs.verification_token ?? "",
+    };
+  } catch {
+    return {};
+  }
+}
+
+/** 合并配置：项目 settings > 全局 settings > 环境变量 */
+function loadConfig(): FeishuConfig {
+  const globalSettings = readFeishuFromSettingsFile(
+    join(homedir(), ".pi", "agent", "settings.json"),
+  );
+  const projectSettings = readFeishuFromSettingsFile(
+    join(process.cwd(), ".pi", "settings.json"),
+  );
+  const s: Record<string, string> = { ...globalSettings, ...projectSettings };
+
+  const domain = (process.env.FEISHU_DOMAIN || s.domain || "feishu") as "feishu" | "lark";
+
   return {
-    appKey: process.env.YUANBAO_APP_ID || "",
-    appSecret: process.env.YUANBAO_APP_SECRET || "",
-    botId: process.env.YUANBAO_BOT_ID || "",
-    wsUrl: process.env.YUANBAO_WS_URL || "",
-    apiDomain: process.env.YUANBAO_API_DOMAIN || "",
-    routeEnv: process.env.YUANBAO_ROUTE_ENV || "",
+    appId: process.env.FEISHU_APP_ID || s.appId || "",
+    appSecret: process.env.FEISHU_APP_SECRET || s.appSecret || "",
+    domain,
+    encryptKey: process.env.FEISHU_ENCRYPT_KEY || s.encryptKey || undefined,
+    verificationToken: process.env.FEISHU_VERIFICATION_TOKEN || s.verificationToken || undefined,
   };
 }
 
-// ─── 扩展入口 ───
+// ─── 扩展入口 ───────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  let client: YuanbaoClient | null = null;
-  let config: YuanbaoConfig = loadConfig();
+  let client: FeishuClient | null = null;
+  let config: FeishuConfig = loadConfig();
   let ctxRef: ExtensionContext | null = null;
 
   /**
@@ -65,155 +108,121 @@ export default function (pi: ExtensionAPI) {
   }
   const pendingTurns: Map<string, PendingTurn> = new Map();
 
-  // ─── 注册 CLI 标志 ───
+  // ─── 注册 CLI 标志 ────────────────────────────────────
 
-  pi.registerFlag("yuanbao-app-id", {
-    description: "元宝 App Key (也叫 app_id)",
+  pi.registerFlag("feishu-app-id", {
+    description: "飞书 App ID",
     type: "string",
     default: "",
   });
 
-  pi.registerFlag("yuanbao-app-secret", {
-    description: "元宝 App Secret",
+  pi.registerFlag("feishu-app-secret", {
+    description: "飞书 App Secret",
     type: "string",
     default: "",
   });
 
-  pi.registerFlag("yuanbao-bot-id", {
-    description: "元宝 Bot ID（可选，sign-token API 会返回）",
+  pi.registerFlag("feishu-domain", {
+    description: "飞书域名 (feishu 或 lark)",
     type: "string",
     default: "",
   });
 
-  pi.registerFlag("yuanbao-ws-url", {
-    description: "元宝 WebSocket 网关地址",
+  pi.registerFlag("feishu-encrypt-key", {
+    description: "飞书事件加密密钥（可选）",
     type: "string",
     default: "",
   });
 
-  pi.registerFlag("yuanbao-api-domain", {
-    description: "元宝 API 域名",
+  pi.registerFlag("feishu-verification-token", {
+    description: "飞书事件验证令牌（可选）",
     type: "string",
     default: "",
   });
 
-  pi.registerFlag("yuanbao-route-env", {
-    description: "路由环境（如 ci-677）",
-    type: "string",
-    default: "",
-  });
+  // ─── 启动飞书客户端 ──────────────────────────────────
 
-  // ─── 启动元宝客户端 ───
-
-  async function startYuanbaoClient(): Promise<void> {
+  async function startFeishuClient(): Promise<void> {
     if (client) {
       client.disconnect();
       client = null;
     }
 
     // 从 CLI 标志读取配置（覆盖环境变量）
-    const flagOverrides: Record<string, string> = {};
-    for (const [key, flag] of [
-      ["appKey", "yuanbao-app-id"],
-      ["appSecret", "yuanbao-app-secret"],
-      ["botId", "yuanbao-bot-id"],
-      ["wsUrl", "yuanbao-ws-url"],
-      ["apiDomain", "yuanbao-api-domain"],
-      ["routeEnv", "yuanbao-route-env"],
-    ] as const) {
+    const flagMap: Record<string, string> = {
+      appId: "feishu-app-id",
+      appSecret: "feishu-app-secret",
+      domain: "feishu-domain",
+      encryptKey: "feishu-encrypt-key",
+      verificationToken: "feishu-verification-token",
+    };
+    const overrides: Partial<FeishuConfig> = {};
+    for (const [key, flag] of Object.entries(flagMap)) {
       const val = pi.getFlag(flag);
-      if (val) flagOverrides[key] = String(val);
+      if (val) (overrides as any)[key] = String(val);
     }
 
-    // 合并配置
-    config = {
-      ...config,
-      ...Object.fromEntries(
-        Object.entries(flagOverrides).filter(([, v]) => v)
-      ),
-    };
+    config = { ...config, ...overrides };
 
     // 检查必要配置
-    if (!config.appKey || !config.appSecret) {
+    if (!config.appId || !config.appSecret) {
       if (ctxRef?.hasUI) {
-        ctxRef.ui.notify("元宝连接失败：缺少 appKey/appSecret", "error");
+        ctxRef.ui.notify("飞书连接失败：缺少 appId/appSecret", "error");
       }
       return;
     }
 
-    client = new YuanbaoClient(config);
+    client = new FeishuClient(config);
 
-    // 注册消息处理：元宝消息 → Pi 用户消息
-    client.onMessage((msg) => {
-      handleYuanbaoMessage(msg);
+    // 注册消息处理：飞书消息 → Pi 用户消息
+    client.setOnMessage((chatId, msgId, text, chatType) => {
+      handleFeishuMessage(chatId, msgId, text, chatType);
     });
 
     // 注册状态变化处理
-    client.onStatusChange((status) => {
+    client.setOnStatusChange((status) => {
       updateStatus(ctxRef, status);
     });
 
     try {
-      const connected = await client.connect();
-      if (!connected && ctxRef?.hasUI) {
-        ctxRef.ui.notify("元宝 Bot 连接失败", "error");
-      }
+      await client.connect();
     } catch (err) {
       if (ctxRef?.hasUI) {
-        ctxRef.ui.notify(`元宝连接错误: ${err}`, "error");
+        ctxRef.ui.notify(`飞书连接错误: ${err}`, "error");
       }
     }
   }
 
-  // ─── 处理元宝消息 → 转发给 Pi ───
+  // ─── 处理飞书消息 → 转发给 Pi ────────────────────────
 
-  async function handleYuanbaoMessage(msg: IncomingMessage): Promise<void> {
-    const content = msg.text?.trim();
+  function handleFeishuMessage(
+    chatId: string,
+    msgId: string,
+    text: string,
+    _chatType: "p2p" | "group",
+  ): void {
+    const content = text.trim();
     if (!content) return;
 
-    flashStatus(`元宝: 📩 ${content.substring(0, 20)}${content.length > 20 ? "..." : ""}`);
+    flashStatus(`飞书: 📩 ${content.substring(0, 20)}${content.length > 20 ? "..." : ""}`);
 
     // 记录该 chatId 对应的消息，用于后续回复
-    pendingTurns.set(msg.chatId, {
-      chatId: msg.chatId,
-      msgId: msg.msgId,
-    });
+    pendingTurns.set(chatId, { chatId, msgId });
 
-    // 开始发送 reply heartbeat（告诉元宝正在处理中）
-    client?.startReplyHeartbeat(msg.chatId);
-
-    // 如果包含图片/文件 URL，自动下载到本地后传给 Pi
-    const mediaMatch = content.match(/\[(图片|文件[^\]]*)\]\s*(https?:\/\/\S+)/);
-    if (mediaMatch && client) {
-      flashStatus("元宝: 📥 下载资源中...");
-      const localPath = await client.downloadResource(mediaMatch[2]).catch(() => null);
-      if (localPath) {
-        // 用本地路径替换原始 URL
-        const localContent = content.replace(mediaMatch[2], localPath);
-        pi.sendUserMessage(localContent);
-      } else {
-        // 下载失败，发送原始内容
-        pi.sendUserMessage(content);
-      }
-    } else {
-      // 纯文本消息
-      pi.sendUserMessage(content);
-    }
-
-    // 更新状态
-    updateStatus(ctxRef, client?.getStatus() ?? "disconnected");
+    // 发送给 Pi
+    pi.sendUserMessage(content);
   }
 
-  // ─── 监听 Pi 响应 → 回传给元宝 ───
+  // ─── 监听 Pi 响应 → 回传给飞书 ────────────────────────
 
-  // 每轮 Turn 结束 → 推送到手机（每轮思考/回复都会实时推送）
+  // 每轮 Turn 结束 → 推送到飞书
   pi.on("turn_end", (event: TurnEndEvent) => {
     if (!client || client.getStatus() !== "connected") return;
 
     const chatId = findActiveChatId();
     if (!chatId) return;
 
-    // 只处理 assistant 消息（跳过 tool_result 等）
+    // 只处理 assistant 消息
     if (event.message?.role !== "assistant") return;
 
     const textContent = extractTextFromMessage(event.message);
@@ -227,20 +236,17 @@ export default function (pi: ExtensionAPI) {
     for (const chunk of chunks) {
       client.sendMessage(chatId, chunk, replyToMsgId || undefined);
     }
-    flashStatus(`元宝: 📤 推送中 (${textContent.length}字)`);
+    flashStatus(`飞书: 📤 推送中 (${textContent.length}字)`);
   });
 
-  // Agent 循环结束 → 停止 heartbeat，清理状态
-  pi.on("agent_end", (event: AgentEndEvent) => {
+  // Agent 循环结束 → 清理状态
+  pi.on("agent_end", (_event: AgentEndEvent) => {
     const chatId = findActiveChatId();
     if (!chatId) return;
 
-    // 停止 reply heartbeat
-    client?.stopReplyHeartbeat(chatId);
-
     // 清除该 chat 的 pending turn
     pendingTurns.delete(chatId);
-    flashStatus(`元宝: ✅ 完成`);
+    flashStatus("飞书: ✅ 完成");
   });
 
   /**
@@ -248,7 +254,6 @@ export default function (pi: ExtensionAPI) {
    * 策略：返回 pendingTurns 中最后一个（最近收到的消息来源）。
    */
   function findActiveChatId(): string | null {
-    // pendingTurns 是按插入顺序的，最后一个是最新的
     let lastKey: string | null = null;
     for (const key of pendingTurns.keys()) {
       lastKey = key;
@@ -256,17 +261,17 @@ export default function (pi: ExtensionAPI) {
     return lastKey;
   }
 
-  // ─── 注册 /yuanbao 命令 ───
+  // ─── 注册 /feishu 命令 ────────────────────────────────
 
-  pi.registerCommand("yuanbao", {
-    description: "管理元宝 Bot 连接 (start/stop/status/config/help)",
+  pi.registerCommand("feishu", {
+    description: "管理飞书 Bot 连接 (start/stop/status/config/help)",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const action = args.trim().toLowerCase() || "status";
 
       switch (action) {
         case "start":
-          await startYuanbaoClient();
-          ctx.ui.notify("元宝客户端已启动", "info");
+          await startFeishuClient();
+          ctx.ui.notify("飞书客户端已启动", "info");
           break;
 
         case "stop":
@@ -274,18 +279,16 @@ export default function (pi: ExtensionAPI) {
             client.disconnect();
             client = null;
           }
-          ctx.ui.notify("元宝客户端已停止", "info");
+          ctx.ui.notify("飞书客户端已停止", "info");
           break;
 
         case "status": {
           const status = client?.getStatus() ?? "未启动";
-          const botId = client?.getBotId() ?? "无";
           ctx.ui.notify(
-            `元宝 Bot 状态: ${status}\n` +
-            `Bot ID: ${botId}\n` +
-            `App Key: ${config.appKey ? "****" + config.appKey.slice(-4) : "未设置"}\n` +
-            `API Domain: ${config.apiDomain || "默认"}`,
-            "info"
+            `飞书 Bot 状态: ${status}\n` +
+              `App ID: ${config.appId ? "****" + config.appId.slice(-4) : "未设置"}\n` +
+              `Domain: ${config.domain || "feishu"}`,
+            "info",
           );
           break;
         }
@@ -293,57 +296,59 @@ export default function (pi: ExtensionAPI) {
         case "config":
           ctx.ui.notify(
             `当前配置:\n` +
-            `App Key: ${config.appKey ? "****" + config.appKey.slice(-4) : "未设置"}\n` +
-            `App Secret: ${config.appSecret ? "****" : "未设置"}\n` +
-            `Bot ID: ${config.botId || "自动获取"}\n` +
-            `WS URL: ${config.wsUrl || "默认"}\n` +
-            `API Domain: ${config.apiDomain || "默认"}\n` +
-            `Route Env: ${config.routeEnv || "无"}`,
-            "info"
+              `App ID: ${config.appId ? "****" + config.appId.slice(-4) : "未设置"}\n` +
+              `App Secret: ${config.appSecret ? "****" : "未设置"}\n` +
+              `Domain: ${config.domain || "feishu"}\n` +
+              `Encrypt Key: ${config.encryptKey ? "已设置" : "未设置"}\n` +
+              `Verification Token: ${config.verificationToken ? "已设置" : "未设置"}`,
+            "info",
           );
           break;
 
         case "help":
           ctx.ui.notify(
-            `/yuanbao 命令用法:\n` +
-            `  /yuanbao start   - 启动元宝 Bot 连接\n` +
-            `  /yuanbao stop    - 断开元宝 Bot 连接\n` +
-            `  /yuanbao status  - 查看连接状态\n` +
-            `  /yuanbao config  - 查看当前配置\n` +
-            `  /yuanbao help    - 显示帮助\n\n` +
-            `配置方式:\n` +
-            `  环境变量: YUANBAO_APP_ID, YUANBAO_APP_SECRET\n` +
-            `  CLI 标志: --yuanbao-app-id, --yuanbao-app-secret`,
-            "info"
+            `/feishu 命令用法:\n` +
+              `  /feishu start   - 启动飞书 Bot 连接\n` +
+              `  /feishu stop    - 断开飞书 Bot 连接\n` +
+              `  /feishu status  - 查看连接状态\n` +
+              `  /feishu config  - 查看当前配置\n` +
+              `  /feishu help    - 显示帮助\n\n` +
+              `配置优先级（从高到低）:\n` +
+              `  1. CLI 标志: --feishu-app-id, --feishu-app-secret\n` +
+              `  2. 环境变量: FEISHU_APP_ID, FEISHU_APP_SECRET\n` +
+              `  3. settings.json 中的 feishu 字段`,
+            "info",
           );
           break;
 
         default:
-          ctx.ui.notify(`未知命令: ${action}，使用 /yuanbao help 查看帮助`, "warning");
+          ctx.ui.notify(`未知命令: ${action}，使用 /feishu help 查看帮助`, "warning");
       }
     },
   });
 
-  // ─── 注册自定义工具：发送消息到元宝 ───
+  // ─── 注册自定义工具：发送消息到飞书 ────────────────────
 
-  // 工具参数 schema（纯 JSON Schema，兼容 TypeBox）
-  const SendToYuanbaoParams = {
+  const SendToFeishuParams = {
     type: "object" as const,
     properties: {
       message: { type: "string" as const, description: "要发送的消息内容" },
-      chat_id: { type: "string" as const, description: "目标聊天 ID（如 dm:xxx 或 group:xxx），留空则发送到最近活跃的聊天" },
+      chat_id: {
+        type: "string" as const,
+        description: "目标聊天 ID（飞书 chat_id），留空则发送到最近活跃的聊天",
+      },
     },
     required: ["message"],
   };
 
   pi.registerTool({
-    name: "send_to_yuanbao",
-    label: "发送到元宝",
-    description: "发送消息到元宝聊天界面。当用户要求通过元宝发送消息时使用。",
-    parameters: SendToYuanbaoParams,
+    name: "send_to_feishu",
+    label: "发送到飞书",
+    description: "发送消息到飞书聊天界面。当用户要求通过飞书发送消息时使用。",
+    parameters: SendToFeishuParams,
     async execute(
       _toolCallId: string,
-      params: Static<typeof SendToYuanbaoParams>,
+      params: Static<typeof SendToFeishuParams>,
       _signal: AbortSignal | undefined,
       _onUpdate: any,
       _ctx: ExtensionContext,
@@ -353,45 +358,47 @@ export default function (pi: ExtensionAPI) {
 
       if (!client || client.getStatus() !== "connected") {
         return {
-          content: [{ type: "text" as const, text: "错误: 元宝 Bot 未连接。请先运行 /yuanbao start 启动连接。" }],
+          content: [
+            { type: "text" as const, text: "错误: 飞书 Bot 未连接。请先运行 /feishu start 启动连接。" },
+          ],
           details: {} as Record<string, unknown>,
         };
       }
 
       if (!chatId) {
         return {
-          content: [{ type: "text" as const, text: "错误: 没有活跃的元宝聊天。请先在元宝中发送一条消息。" }],
+          content: [
+            { type: "text" as const, text: "错误: 没有活跃的飞书聊天。请先在飞书中发送一条消息。" },
+          ],
           details: {} as Record<string, unknown>,
         };
       }
 
-      client.sendMessage(chatId, message);
+      await client.sendMessage(chatId, message);
       return {
-        content: [{ type: "text" as const, text: `已发送到元宝 [${chatId}]: ${message}` }],
+        content: [{ type: "text" as const, text: `已发送到飞书 [${chatId}]: ${message}` }],
         details: { sent: true, chatId, message } as Record<string, unknown>,
       };
     },
   });
 
-  // ─── 会话启动时自动连接 ───
+  // ─── 会话启动时自动连接 ────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
     ctxRef = ctx;
-
-    // 设置状态栏
     updateStatus(ctx, "disconnected");
 
     // 自动连接
     try {
-      await startYuanbaoClient();
+      await startFeishuClient();
     } catch (err) {
       if (ctx.hasUI) {
-        ctx.ui.notify(`元宝连接失败: ${err}`, "error");
+        ctx.ui.notify(`飞书连接失败: ${err}`, "error");
       }
     }
   });
 
-  // ─── 会话关闭时清理 ───
+  // ─── 会话关闭时清理 ────────────────────────────────────
 
   pi.on("session_shutdown", async () => {
     if (client) {
@@ -401,12 +408,11 @@ export default function (pi: ExtensionAPI) {
     pendingTurns.clear();
   });
 
-  // ─── 辅助函数 ───
+  // ─── 辅助函数 ────────────────────────────────────────
 
-  /** 从消息中提取文本内容 */
+  /** 从 Pi 消息中提取文本内容 */
   function extractTextFromMessage(message: any): string | null {
     if (!message?.content) return null;
-
     const parts: string[] = [];
     for (const block of message.content) {
       if (block.type === "text" && block.text) {
@@ -414,21 +420,6 @@ export default function (pi: ExtensionAPI) {
       }
     }
     return parts.length > 0 ? parts.join("\n") : null;
-  }
-
-  /** 从 agent_end 的所有消息中提取最后一条 assistant 消息的文本 */
-  function extractLastAssistantText(messages: any[]): string | null {
-    if (!messages || !Array.isArray(messages)) return null;
-
-    // 从后往前找最后一条 assistant 消息
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg?.role === "assistant") {
-        const text = extractTextFromMessage(msg);
-        if (text) return text;
-      }
-    }
-    return null;
   }
 
   /** 状态栏瞬态消息定时器 */
@@ -439,38 +430,35 @@ export default function (pi: ExtensionAPI) {
     if (!ctx?.hasUI) return;
 
     const statusMap: Record<string, string> = {
-      connecting: "元宝: 连接中",
-      authenticating: "元宝: 认证中",
-      connected: "元宝: 已连接",
-      disconnected: "元宝: 未连接",
-      error: "元宝: 错误",
+      connecting: "飞书: 连接中",
+      connected: "飞书: 已连接",
+      disconnected: "飞书: 未连接",
+      error: "飞书: 错误",
     };
 
-    const text = statusMap[status] ?? `元宝: ${status}`;
-    ctx.ui.setStatus("yuanbao", text);
+    const text = statusMap[status] ?? `飞书: ${status}`;
+    ctx.ui.setStatus("feishu", text);
   }
 
   /**
-   * 在状态栏显示瞬态消息（如"收到消息"、"已回复"）。
+   * 在状态栏显示瞬态消息。
    * 5 秒后自动恢复为连接状态。
    */
   function flashStatus(message: string): void {
     if (!ctxRef?.hasUI) return;
-
     if (statusTimer) clearTimeout(statusTimer);
-    ctxRef.ui.setStatus("yuanbao", message);
+    ctxRef.ui.setStatus("feishu", message);
 
     statusTimer = setTimeout(() => {
       statusTimer = null;
-      // 恢复为连接状态
       if (client && client.getStatus() === "connected") {
-        ctxRef?.ui.setStatus("yuanbao", "元宝: 已连接");
+        ctxRef?.ui.setStatus("feishu", "飞书: 已连接");
       }
     }, 5000);
   }
 
   /**
-   * 将长文本分块，避免超过元宝单条消息限制。
+   * 将长文本分块，避免超过飞书单条消息限制。
    * 优先在换行符处分割，保持段落完整性。
    */
   function chunkText(text: string, maxLen: number): string[] {
@@ -492,7 +480,7 @@ export default function (pi: ExtensionAPI) {
         splitPos = remaining.lastIndexOf(" ", maxLen);
       }
       if (splitPos <= 0) {
-        // 没有合适的空格，强制分割（不超过 maxLen）
+        // 强制分割
         chunks.push(remaining.substring(0, maxLen));
         remaining = remaining.substring(maxLen);
       } else {
