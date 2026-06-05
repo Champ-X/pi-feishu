@@ -9,24 +9,26 @@
  * 3. 监听 Pi 响应 → 回传给飞书（回复/新消息/交互卡片）
  * 4. 媒体收发：下载图片/文件 → 上传到 Pi，Pi 生成的图片/文件 → 上传到飞书
  * 5. Reaction 输入指示：处理中显示 Typing，失败显示 CrossMark
- * 6. 流式卡片：长响应使用交互卡片实时更新
- * 7. 注册 /feishu 命令管理连接状态
+ * 6. 工具进度：每个工具调用都实时推送到飞书（可编辑卡片）
+ * 7. 流式输出：message_update 事件实时更新卡片内容
+ * 8. 中间文本：assistant 思考过程中的文本也推送到飞书
+ * 9. 注册 /feishu 命令管理连接状态
+ *
+ * 消息流程（参考 hermes-agent）：
+ *
+ *   用户消息 →
+ *     [Typing Reaction] →
+ *     tool_execution_start → [进度卡片: 🔧 bash...] →
+ *     tool_execution_end   → [进度卡片: 🔧 bash ✓] →
+ *     turn_end (text+toolCalls) → [中间文本: "让我查找..."] →
+ *     ... 下一轮工具 ... →
+ *     turn_end (text only) → [最终回复] →
+ *     [移除 Typing Reaction]
  *
  * 配置优先级（从高到低）：
  *   1. CLI 标志: --feishu-app-id, --feishu-app-secret 等
  *   2. 环境变量: FEISHU_APP_ID, FEISHU_APP_SECRET 等
  *   3. Pi settings.json 中的 feishu 字段
- *
- * settings.json 配置示例：
- *   {
- *     "feishu": {
- *       "appId": "cli_xxx",
- *       "appSecret": "xxx",
- *       "domain": "feishu",
- *       "encryptKey": "",
- *       "verificationToken": ""
- *     }
- *   }
  */
 
 import type {
@@ -37,7 +39,7 @@ import type {
   AgentEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { Static } from "typebox";
-import { readFileSync, existsSync, readdirSync, unlinkSync, statSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { FeishuClient } from "./feishu-client.js";
@@ -49,18 +51,32 @@ import type { FeishuConfig } from "./types.js";
 /** 飞书 post 消息单条最大字符数（约 4000） */
 const MAX_TEXT_CHUNK = 4000;
 
-/** 使用流式卡片的消息长度阈值（超过此值用卡片，否则普通文本） */
-const STREAMING_CARD_THRESHOLD = 800;
+/** 流式卡片更新节流间隔（毫秒） */
+const STREAM_THROTTLE_MS = 1500;
 
-/** 流式卡片更新间隔（毫秒） */
-const CARD_UPDATE_INTERVAL = 2000;
+/** 工具名到友好名称的映射 */
+const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  bash: "Shell",
+  read: "读取文件",
+  edit: "编辑文件",
+  write: "写入文件",
+  grep: "搜索",
+  find: "查找文件",
+  ls: "列出目录",
+  glob: "匹配文件",
+  agent: "子代理",
+  send_to_feishu: "发送消息",
+  send_image_to_feishu: "发送图片",
+  send_file_to_feishu: "发送文件",
+};
+
+/** 友好化工具名 */
+function toolDisplayName(name: string): string {
+  return TOOL_DISPLAY_NAMES[name] ?? name;
+}
 
 // ─── 从 Pi settings.json 读取 feishu 配置段 ──────────────
 
-/**
- * 从 JSON 文件中读取 feishu 配置段。
- * 文件不存在或解析失败时静默返回空对象。
- */
 function readFeishuFromSettingsFile(filePath: string): Record<string, string> {
   try {
     if (!existsSync(filePath)) return {};
@@ -80,7 +96,6 @@ function readFeishuFromSettingsFile(filePath: string): Record<string, string> {
   }
 }
 
-/** 合并配置：项目 settings > 全局 settings > 环境变量 */
 function loadConfig(): FeishuConfig {
   const globalSettings = readFeishuFromSettingsFile(
     join(homedir(), ".pi", "agent", "settings.json"),
@@ -101,6 +116,30 @@ function loadConfig(): FeishuConfig {
   };
 }
 
+// ─── Chat 状态 ──────────────────────────────────────────
+
+interface ChatState {
+  chatId: string;
+  /** 用户原始消息 ID，用于 reply threading */
+  userMsgId: string;
+
+  // ── 工具进度追踪 ──
+  /** 进度卡片消息 ID（所有工具共用一个可编辑卡片） */
+  progressMsgId: string | null;
+  /** 工具执行记录 */
+  toolEntries: Array<{ name: string; status: "running" | "done" | "error" }>;
+
+  // ── 流式输出追踪 ──
+  /** 流式卡片消息 ID */
+  streamMsgId: string | null;
+  /** 流式累积文本 */
+  streamText: string;
+  /** 最后一次流式卡片更新时间 */
+  lastStreamUpdate: number;
+  /** 是否已经通过流式推送了最终文本 */
+  alreadyStreamed: boolean;
+}
+
 // ─── 扩展入口 ───────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -108,21 +147,8 @@ export default function (pi: ExtensionAPI) {
   let config: FeishuConfig = loadConfig();
   let ctxRef: ExtensionContext | null = null;
 
-  /**
-   * 消息队列：chatId → 等待中的 Pi turn 信息。
-   * 支持多个用户同时与 Bot 对话，每个 chatId 有独立的回复目标。
-   */
-  interface PendingTurn {
-    chatId: string;
-    msgId: string;
-    /** 流式卡片消息 ID（用于实时更新） */
-    cardMsgId: string | null;
-    /** 累积的响应文本（用于流式卡片） */
-    accumulatedText: string;
-    /** 最后一次卡片更新时间 */
-    lastCardUpdate: number;
-  }
-  const pendingTurns: Map<string, PendingTurn> = new Map();
+  /** 每个聊天独立的状态 */
+  const chatStates: Map<string, ChatState> = new Map();
 
   // ─── 注册 CLI 标志 ────────────────────────────────────
 
@@ -131,25 +157,21 @@ export default function (pi: ExtensionAPI) {
     type: "string",
     default: "",
   });
-
   pi.registerFlag("feishu-app-secret", {
     description: "飞书 App Secret",
     type: "string",
     default: "",
   });
-
   pi.registerFlag("feishu-domain", {
     description: "飞书域名 (feishu 或 lark)",
     type: "string",
     default: "",
   });
-
   pi.registerFlag("feishu-encrypt-key", {
     description: "飞书事件加密密钥（可选）",
     type: "string",
     default: "",
   });
-
   pi.registerFlag("feishu-verification-token", {
     description: "飞书事件验证令牌（可选）",
     type: "string",
@@ -164,7 +186,6 @@ export default function (pi: ExtensionAPI) {
       client = null;
     }
 
-    // 从 CLI 标志读取配置（覆盖环境变量）
     const flagMap: Record<string, string> = {
       appId: "feishu-app-id",
       appSecret: "feishu-app-secret",
@@ -177,10 +198,8 @@ export default function (pi: ExtensionAPI) {
       const val = pi.getFlag(flag);
       if (val) (overrides as any)[key] = String(val);
     }
-
     config = { ...config, ...overrides };
 
-    // 检查必要配置
     if (!config.appId || !config.appSecret) {
       if (ctxRef?.hasUI) {
         ctxRef.ui.notify("飞书连接失败：缺少 appId/appSecret", "error");
@@ -190,12 +209,9 @@ export default function (pi: ExtensionAPI) {
 
     client = new FeishuClient(config);
 
-    // 注册消息处理：飞书消息 → Pi 用户消息
     client.setOnMessage((chatId, msgId, text, chatType, resources) => {
       handleFeishuMessage(chatId, msgId, text, chatType, resources);
     });
-
-    // 注册状态变化处理
     client.setOnStatusChange((status) => {
       updateStatus(ctxRef, status);
     });
@@ -209,7 +225,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // ─── 处理飞书消息 → 转发给 Pi ────────────────────────
+  // ─── 处理飞书入站消息 → 转发给 Pi ────────────────────
 
   async function handleFeishuMessage(
     chatId: string,
@@ -223,7 +239,7 @@ export default function (pi: ExtensionAPI) {
 
     flashStatus(`飞书: 📩 ${content.substring(0, 20)}${content.length > 20 ? "..." : ""}`);
 
-    // ─── Phase 2: 处理入站媒体资源 ──────────────────────
+    // 下载入站媒体
     let resourceDescription = "";
     for (const res of resources) {
       const localPath = await client!.downloadResource(
@@ -233,143 +249,260 @@ export default function (pi: ExtensionAPI) {
         res.fileName,
       );
       if (localPath) {
-        resourceDescription += `\n[收到${res.type === "image" ? "图片" : res.type === "audio" ? "语音" : res.type === "video" ? "视频" : "文件"}: ${localPath}]`;
+        const typeLabel =
+          res.type === "image" ? "图片" :
+          res.type === "audio" ? "语音" :
+          res.type === "video" ? "视频" : "文件";
+        resourceDescription += `\n[收到${typeLabel}: ${localPath}]`;
       }
     }
 
-    // 记录该 chatId 对应的消息，用于后续回复
-    pendingTurns.set(chatId, {
+    // 初始化聊天状态
+    chatStates.set(chatId, {
       chatId,
-      msgId,
-      cardMsgId: null,
-      accumulatedText: "",
-      lastCardUpdate: 0,
+      userMsgId: msgId,
+      progressMsgId: null,
+      toolEntries: [],
+      streamMsgId: null,
+      streamText: "",
+      lastStreamUpdate: 0,
+      alreadyStreamed: false,
     });
 
-    // ─── Phase 3: 添加 Typing Reaction ─────────────────
+    // 添加 Typing Reaction
     await client!.startTyping(chatId, msgId);
 
-    // 发送给 Pi（附加资源描述）
+    // 发送给 Pi
     const fullContent = content + (resourceDescription ? "\n" + resourceDescription : "");
     pi.sendUserMessage(fullContent);
   }
 
-  // ─── 监听 Pi 响应 → 回传给飞书 ────────────────────────
+  // ═══════════════════════════════════════════════════════
+  //  Pi 事件处理 — 工具进度 + 流式输出 + 回复
+  // ═══════════════════════════════════════════════════════
 
-  // 每轮 Turn 结束 → 推送到飞书
-  pi.on("turn_end", (event: TurnEndEvent) => {
+  // ─── tool_execution_start → 更新进度卡片 ──────────────
+
+  pi.on("tool_execution_start", (event: any) => {
     if (!client || client.getStatus() !== "connected") return;
+    const state = findActiveState();
+    if (!state) return;
 
-    const chatId = findActiveChatId();
-    if (!chatId) return;
+    const toolName = event.toolName as string;
+    state.toolEntries.push({ name: toolName, status: "running" });
 
-    // 只处理 assistant 消息
-    if (event.message?.role !== "assistant") return;
+    updateProgressCard(state);
+    flashStatus(`飞书: 🔧 ${toolDisplayName(toolName)}...`);
+  });
 
-    const textContent = extractTextFromMessage(event.message);
-    if (!textContent) return;
+  // ─── tool_execution_end → 更新进度卡片 ────────────────
 
-    const pending = pendingTurns.get(chatId);
-    const replyToMsgId = pending?.msgId;
+  pi.on("tool_execution_end", (event: any) => {
+    if (!client || client.getStatus() !== "connected") return;
+    const state = findActiveState();
+    if (!state) return;
 
-    // 累积文本
-    if (pending) {
-      pending.accumulatedText += (pending.accumulatedText ? "\n\n" : "") + textContent;
+    const toolName = event.toolName as string;
+    const isError = event.isError as boolean;
+
+    // 找到对应的 running 条目并更新状态
+    for (let i = state.toolEntries.length - 1; i >= 0; i--) {
+      if (state.toolEntries[i].name === toolName && state.toolEntries[i].status === "running") {
+        state.toolEntries[i].status = isError ? "error" : "done";
+        break;
+      }
     }
 
-    // ─── Phase 3: 流式卡片 vs 普通文本 ──────────────────
-    const accumulated = pending?.accumulatedText ?? textContent;
+    updateProgressCard(state);
+  });
 
-    if (accumulated.length > STREAMING_CARD_THRESHOLD && pending) {
-      // 长响应：使用流式卡片
-      handleStreamingCard(chatId, pending, accumulated);
-    } else {
-      // 短响应：直接发文本
+  // ─── message_update → 流式文本推送 ────────────────────
+
+  pi.on("message_update", (event: any) => {
+    if (!client || client.getStatus() !== "connected") return;
+    const state = findActiveState();
+    if (!state) return;
+
+    // 只处理 assistant 消息的文本更新
+    const message = event.message;
+    if (!message || message.role !== "assistant") return;
+
+    // 提取当前累积的文本
+    const text = extractTextFromMessage(message);
+    if (!text) return;
+
+    // 如果文本发生了变化，更新流式卡片
+    if (text === state.streamText) return;
+    state.streamText = text;
+
+    const now = Date.now();
+
+    // 首次有文本 → 创建流式卡片
+    if (!state.streamMsgId) {
+      const card = FeishuClient.buildStreamingCard(text, "⏳ 生成中...");
+      client.sendCard(state.chatId, card, state.userMsgId).then((cardMsgId) => {
+        if (cardMsgId) {
+          state.streamMsgId = cardMsgId;
+          state.lastStreamUpdate = Date.now();
+        }
+      }).catch(() => {});
+      return;
+    }
+
+    // 节流更新
+    if (now - state.lastStreamUpdate < STREAM_THROTTLE_MS) return;
+
+    const card = FeishuClient.buildStreamingCard(text, "⏳ 生成中...");
+    client.updateCard(state.streamMsgId, card).then(() => {
+      state.lastStreamUpdate = Date.now();
+    }).catch(() => {
+      state.streamMsgId = null;
+    });
+  });
+
+  // ─── turn_end → 发送中间/最终文本 ─────────────────────
+
+  pi.on("turn_end", (event: TurnEndEvent) => {
+    if (!client || client.getStatus() !== "connected") return;
+    const state = findActiveState();
+    if (!state) return;
+
+    const message = event.message;
+    if (!message || message.role !== "assistant") return;
+
+    const textContent = extractTextFromMessage(message);
+    if (!textContent) return;
+
+    // 检查这一轮是否包含工具调用
+    const hasToolCalls = message.content?.some((block: any) => block.type === "toolCall");
+
+    // 如果流式推送已经展示了文本，跳过 turn_end 的重复推送
+    if (state.alreadyStreamed && state.streamMsgId) {
+      // 流式卡片已经有内容了，只需确保最新文本已更新
+      if (textContent !== state.streamText) {
+        state.streamText = textContent;
+        const card = FeishuClient.buildStreamingCard(textContent, "⏳ 生成中...");
+        client.updateCard(state.streamMsgId, card).catch(() => {});
+      }
+      return;
+    }
+
+    // 标记流式已经开始推送
+    if (state.streamMsgId) {
+      state.alreadyStreamed = true;
+      // 更新流式卡片为最新文本
+      if (textContent !== state.streamText) {
+        state.streamText = textContent;
+        const card = FeishuClient.buildStreamingCard(textContent, "⏳ 生成中...");
+        client.updateCard(state.streamMsgId, card).catch(() => {});
+      }
+      return;
+    }
+
+    // ── 没有流式卡片，直接发送文本 ──
+
+    if (hasToolCalls) {
+      // 中间轮：assistant 有文本 + 工具调用 → 发送中间文本
       const chunks = chunkText(textContent, MAX_TEXT_CHUNK);
       for (const chunk of chunks) {
-        client.sendMessage(chatId, chunk, replyToMsgId || undefined);
+        client.sendMessage(state.chatId, chunk, state.userMsgId);
+      }
+    } else {
+      // 最终轮（或无工具调用的单轮）→ 发送文本
+      const chunks = chunkText(textContent, MAX_TEXT_CHUNK);
+      for (const chunk of chunks) {
+        client.sendMessage(state.chatId, chunk);
       }
     }
 
     flashStatus(`飞书: 📤 推送中 (${textContent.length}字)`);
   });
 
-  // Agent 循环结束 → 最终化并发送完整响应
+  // ─── agent_end → 最终化 ──────────────────────────────
+
   pi.on("agent_end", (_event: AgentEndEvent) => {
     if (!client || client.getStatus() !== "connected") return;
+    const state = findActiveState();
+    if (!state) return;
 
-    const chatId = findActiveChatId();
-    if (!chatId) return;
-
-    const pending = pendingTurns.get(chatId);
-
-    // ─── Phase 3: 最终化流式卡片 ────────────────────────
-    if (pending?.cardMsgId && pending.accumulatedText) {
-      const finalCard = FeishuClient.buildFinalCard(pending.accumulatedText);
-      client.updateCard(pending.cardMsgId, finalCard).catch(() => {});
+    // 最终化流式卡片（如果存在）
+    if (state.streamMsgId && state.streamText) {
+      const finalCard = FeishuClient.buildFinalCard(state.streamText);
+      client.updateCard(state.streamMsgId, finalCard).catch(() => {});
     }
 
-    // ─── Phase 3: 移除 Typing Reaction ─────────────────
-    client.stopTyping(chatId, true).catch(() => {});
+    // 移除 Typing Reaction
+    client.stopTyping(state.chatId, true).catch(() => {});
 
-    // 清除该 chat 的 pending turn
-    pendingTurns.delete(chatId);
+    // 清理状态
+    chatStates.delete(state.chatId);
     flashStatus("飞书: ✅ 完成");
   });
 
-  // ─── 流式卡片处理 ──────────────────────────────────────
+  // ═══════════════════════════════════════════════════════
+  //  进度卡片
+  // ═══════════════════════════════════════════════════════
 
   /**
-   * 处理流式卡片更新。
-   * 首次创建卡片，后续实时更新内容。
+   * 构建工具进度卡片内容。
+   * 所有工具共用一条可编辑消息，显示调用历史和当前状态。
    */
-  function handleStreamingCard(
-    chatId: string,
-    pending: PendingTurn,
-    text: string,
-  ): void {
-    if (!client) return;
-
-    const now = Date.now();
-
-    // 首次创建卡片
-    if (!pending.cardMsgId) {
-      const card = FeishuClient.buildStreamingCard(text, "🤔 思考中...");
-      const replyTo = pending.msgId || undefined;
-
-      client.sendCard(chatId, card, replyTo).then((cardMsgId) => {
-        if (cardMsgId) {
-          pending.cardMsgId = cardMsgId;
-          pending.lastCardUpdate = Date.now();
-        }
-      }).catch(() => {});
-
-      return;
+  function buildProgressCardContent(entries: ChatState["toolEntries"]): string {
+    const lines: string[] = [];
+    for (const entry of entries) {
+      const displayName = toolDisplayName(entry.name);
+      switch (entry.status) {
+        case "running":
+          lines.push(`⏳ **${displayName}** ...`);
+          break;
+        case "done":
+          lines.push(`✅ ~~${displayName}~~`);
+          break;
+        case "error":
+          lines.push(`❌ **${displayName}**`);
+          break;
+      }
     }
-
-    // 节流：避免过于频繁更新卡片
-    if (now - pending.lastCardUpdate < CARD_UPDATE_INTERVAL) return;
-
-    // 更新现有卡片
-    const card = FeishuClient.buildStreamingCard(text, "⏳ 生成中...");
-    client.updateCard(pending.cardMsgId, card).then(() => {
-      pending.lastCardUpdate = Date.now();
-    }).catch(() => {
-      // 更新失败，可能消息被撤回，清除 cardMsgId
-      pending.cardMsgId = null;
-    });
+    return lines.join("\n");
   }
 
-  /**
-   * 找到当前应该回复的 chatId。
-   * 策略：返回 pendingTurns 中最后一个（最近收到的消息来源）。
-   */
-  function findActiveChatId(): string | null {
+  /** 创建或更新进度卡片 */
+  function updateProgressCard(state: ChatState): void {
+    if (!client) return;
+
+    const content = buildProgressCardContent(state.toolEntries);
+    const runningCount = state.toolEntries.filter((e) => e.status === "running").length;
+    const status = runningCount > 0 ? `🔧 执行中 (${runningCount})` : "🔧 工具调用";
+
+    const card = FeishuClient.buildStreamingCard(content, status);
+
+    if (!state.progressMsgId) {
+      // 首次创建 — 作为用户消息的回复
+      client.sendCard(state.chatId, card, state.userMsgId).then((cardMsgId) => {
+        if (cardMsgId) {
+          state.progressMsgId = cardMsgId;
+        }
+      }).catch(() => {});
+    } else {
+      // 后续更新
+      client.updateCard(state.progressMsgId, card).catch(() => {
+        // 更新失败（消息被撤回等），重置以便下次重新创建
+        state.progressMsgId = null;
+      });
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════
+  //  辅助
+  // ═══════════════════════════════════════════════════════
+
+  function findActiveState(): ChatState | null {
     let lastKey: string | null = null;
-    for (const key of pendingTurns.keys()) {
+    for (const key of chatStates.keys()) {
       lastKey = key;
     }
-    return lastKey;
+    if (!lastKey) return null;
+    return chatStates.get(lastKey) ?? null;
   }
 
   // ─── 注册 /feishu 命令 ────────────────────────────────
@@ -438,8 +571,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ─── 注册自定义工具：发送消息到飞书 ────────────────────
+  // ─── 注册自定义工具 ──────────────────────────────────
 
+  // 发送文本消息
   const SendToFeishuParams = {
     type: "object" as const,
     properties: {
@@ -465,7 +599,7 @@ export default function (pi: ExtensionAPI) {
       _ctx: ExtensionContext,
     ) {
       const message = params.message as string;
-      const chatId = (params.chat_id as string) || findActiveChatId();
+      const chatId = (params.chat_id as string) || findActiveState()?.chatId;
 
       if (!client || client.getStatus() !== "connected") {
         return {
@@ -493,8 +627,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ─── 注册自定义工具：发送图片到飞书 ────────────────────
-
+  // 发送图片
   const SendImageToFeishuParams = {
     type: "object" as const,
     properties: {
@@ -520,22 +653,18 @@ export default function (pi: ExtensionAPI) {
       _ctx: ExtensionContext,
     ) {
       const filePath = params.file_path as string;
-      const chatId = (params.chat_id as string) || findActiveChatId();
+      const chatId = (params.chat_id as string) || findActiveState()?.chatId;
 
       if (!client || client.getStatus() !== "connected") {
         return {
-          content: [
-            { type: "text" as const, text: "错误: 飞书 Bot 未连接。" },
-          ],
+          content: [{ type: "text" as const, text: "错误: 飞书 Bot 未连接。" }],
           details: {} as Record<string, unknown>,
         };
       }
 
       if (!chatId) {
         return {
-          content: [
-            { type: "text" as const, text: "错误: 没有活跃的飞书聊天。" },
-          ],
+          content: [{ type: "text" as const, text: "错误: 没有活跃的飞书聊天。" }],
           details: {} as Record<string, unknown>,
         };
       }
@@ -556,8 +685,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ─── 注册自定义工具：发送文件到飞书 ────────────────────
-
+  // 发送文件
   const SendFileToFeishuParams = {
     type: "object" as const,
     properties: {
@@ -585,22 +713,18 @@ export default function (pi: ExtensionAPI) {
     ) {
       const filePath = params.file_path as string;
       const fileName = params.file_name as string;
-      const chatId = (params.chat_id as string) || findActiveChatId();
+      const chatId = (params.chat_id as string) || findActiveState()?.chatId;
 
       if (!client || client.getStatus() !== "connected") {
         return {
-          content: [
-            { type: "text" as const, text: "错误: 飞书 Bot 未连接。" },
-          ],
+          content: [{ type: "text" as const, text: "错误: 飞书 Bot 未连接。" }],
           details: {} as Record<string, unknown>,
         };
       }
 
       if (!chatId) {
         return {
-          content: [
-            { type: "text" as const, text: "错误: 没有活跃的飞书聊天。" },
-          ],
+          content: [{ type: "text" as const, text: "错误: 没有活跃的飞书聊天。" }],
           details: {} as Record<string, unknown>,
         };
       }
@@ -621,13 +745,12 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ─── 会话启动时自动连接 ────────────────────────────────
+  // ─── 会话生命周期 ─────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
     ctxRef = ctx;
     updateStatus(ctx, "disconnected");
 
-    // 自动连接
     try {
       await startFeishuClient();
     } catch (err) {
@@ -637,17 +760,15 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // ─── 会话关闭时清理 ────────────────────────────────────
-
   pi.on("session_shutdown", async () => {
     if (client) {
       client.disconnect();
       client = null;
     }
-    pendingTurns.clear();
+    chatStates.clear();
   });
 
-  // ─── 辅助函数 ────────────────────────────────────────
+  // ─── 工具函数 ────────────────────────────────────────
 
   /** 从 Pi 消息中提取文本内容 */
   function extractTextFromMessage(message: any): string | null {
@@ -663,14 +784,11 @@ export default function (pi: ExtensionAPI) {
 
   /** 状态栏瞬态消息定时器 */
   let statusTimer: ReturnType<typeof setTimeout> | null = null;
-  /** 当前状态栏显示的文本 */
   let currentStatusText: string = "";
 
-  /** 更新状态栏显示（连接状态变化时调用） */
   function updateStatus(ctx: ExtensionContext | null, status: string): void {
     if (!ctx?.hasUI) return;
 
-    // 取消待恢复的 flash 定时器
     if (statusTimer) {
       clearTimeout(statusTimer);
       statusTimer = null;
@@ -689,10 +807,6 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("feishu", text);
   }
 
-  /**
-   * 在状态栏显示瞬态消息。
-   * 3 秒后自动恢复为连接状态。
-   */
   function flashStatus(message: string): void {
     if (!ctxRef?.hasUI) return;
     if (statusTimer) clearTimeout(statusTimer);
@@ -713,10 +827,6 @@ export default function (pi: ExtensionAPI) {
     }, 3000);
   }
 
-  /**
-   * 将长文本分块，避免超过飞书单条消息限制。
-   * 优先在换行符处分割，保持段落完整性。
-   */
   function chunkText(text: string, maxLen: number): string[] {
     if (text.length <= maxLen) return [text];
 
@@ -729,18 +839,14 @@ export default function (pi: ExtensionAPI) {
         break;
       }
 
-      // 尝试在换行符处分割
       let splitPos = remaining.lastIndexOf("\n", maxLen);
       if (splitPos <= 0) {
-        // 没有合适的换行符，在空格处分割
         splitPos = remaining.lastIndexOf(" ", maxLen);
       }
       if (splitPos <= 0) {
-        // 强制分割
         chunks.push(remaining.substring(0, maxLen));
         remaining = remaining.substring(maxLen);
       } else {
-        // 在分割符处分割（包含分割符）
         chunks.push(remaining.substring(0, splitPos + 1));
         remaining = remaining.substring(splitPos + 1);
       }
