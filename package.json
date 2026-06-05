@@ -1,0 +1,28 @@
+{
+  "name": "pi-yuanbao",
+  "version": "2.0.0",
+  "description": "Pi extension: Tencent Yuanbao Bot API integration for controlling Pi via Yuanbao",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "pi -e ./src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "npx tsx src/__tests__/proto.test.ts"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.2",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.5.0"
+  },
+  "keywords": [
+    "pi",
+    "extension",
+    "yuanbao",
+    "tencent",
+    "bot-api",
+    "openclaw"
+  ]
+}
