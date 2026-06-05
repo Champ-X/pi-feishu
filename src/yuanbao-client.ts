@@ -614,6 +614,20 @@ export class YuanbaoClient {
     return result;
   }
 
+  /** 从 TIMImageElem 的 msgContent 中提取图片 URL */
+  private extractImageUrl(c: Record<string, any>): string {
+    // 优先从 image_info_array 中取（JSON 格式）
+    const infoArray = c.image_info_array || c["ImageInfoArray"];
+    if (Array.isArray(infoArray) && infoArray.length > 0) {
+      // type=1 是原图，type=2 是大图，type=3 是缩略图
+      const original = infoArray.find((info: any) => info.type === 1) || infoArray[0];
+      if (original?.url) return original.url;
+    }
+    // 回退：直接 url 字段（Protobuf 格式）
+    if (c.url) return c.url;
+    return "";
+  }
+
   /** 处理入站消息推送（支持 JSON 和 Protobuf 两种格式） */
   private handleInboundPush(data: Uint8Array): void {
     const push = this.decodePush(data);
@@ -640,16 +654,60 @@ export class YuanbaoClient {
       `msg_id=${push.msgId.substring(0, 16)}... types=${push.msgBody.map((b) => b.msgType).join(",")}`
     );
 
-    // 提取文本
+    // 提取文本（支持图片、文件、表情等多种消息类型）
     const textParts: string[] = [];
     for (const body of push.msgBody) {
-      if (body.msgType === "TIMTextElem" && body.msgContent?.text) {
-        textParts.push(body.msgContent.text);
+      const c = body.msgContent;
+      if (!c) continue;
+
+      switch (body.msgType) {
+        case "TIMTextElem":
+          if (c.text) textParts.push(c.text);
+          break;
+        case "TIMImageElem": {
+          // 图片 URL 在 image_info_array[0].url 中，或直接在 url 字段
+          const url = this.extractImageUrl(c as Record<string, any>);
+          textParts.push(url ? `[图片] ${url}` : "[图片]");
+          break;
+        }
+        case "TIMFileElem": {
+          // 文件：file_name + url（注意 JSON 格式用 file_name 而非 fileName）
+          const fileName = (c as any).file_name || c.fileName || "";
+          const fileUrl = c.url || "";
+          if (fileName && fileUrl) {
+            textParts.push(`[文件: ${fileName}] ${fileUrl}`);
+          } else if (fileName) {
+            textParts.push(`[文件: ${fileName}]`);
+          } else {
+            textParts.push("[文件]");
+          }
+          break;
+        }
+        case "TIMFaceElem":
+          textParts.push("[表情]");
+          break;
+        case "TIMSoundElem":
+          textParts.push("[语音]");
+          break;
+        case "TIMCustomElem":
+          if (c.data) {
+            try {
+              const data = typeof c.data === "string" ? JSON.parse(c.data) : c.data;
+              if (data?.text) textParts.push(data.text);
+            } catch {
+              if (typeof c.data === "string") textParts.push(c.data);
+            }
+          }
+          break;
+        default:
+          if (c.desc) textParts.push(c.desc);
+          else if (c.text) textParts.push(c.text);
+          break;
       }
     }
     const text = textParts.join("").trim();
     if (!text) {
-      console.debug("[YuanbaoClient] No text content in message");
+      console.debug("[YuanbaoClient] No extractable content in message");
       return;
     }
 
