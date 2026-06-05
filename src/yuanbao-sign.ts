@@ -34,6 +34,9 @@ const RETRY_DELAY_MS = 1000;
 const CACHE_REFRESH_MARGIN_S = 60;
 const HTTP_TIMEOUT_MS = 10_000;
 
+// 日志静默：console.log 在 Pi 中会显示到聊天区域
+const _log = (..._args: any[]) => {};
+
 let _cache: CachedToken | null = null;
 let _refreshPromise: Promise<TokenData> | null = null;
 
@@ -90,11 +93,11 @@ async function fetchToken(
     if (routeEnv) headers["X-Route-Env"] = routeEnv;
 
     if (attempt > 0) {
-      console.log(`[SignManager] Retry ${attempt}/${MAX_RETRIES}...`);
+      _log(`[SignManager] Retry ${attempt}/${MAX_RETRIES}...`);
       await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
     }
 
-    console.log(`[SignManager] Fetching sign token from ${url}`);
+    _log(`[SignManager] Fetching sign token from ${url}`);
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
@@ -121,7 +124,7 @@ async function fetchToken(
         if (!data || typeof data !== "object") {
           throw new Error(`Sign token response missing 'data' field: ${JSON.stringify(result)}`);
         }
-        console.log(`[SignManager] Sign token success: bot_id=${data.bot_id}`);
+        _log(`[SignManager] Sign token success: bot_id=${data.bot_id}`);
         return {
           token: data.token || "",
           botId: data.bot_id || "",
@@ -132,7 +135,7 @@ async function fetchToken(
       }
 
       if (code === RETRYABLE_CODE && attempt < MAX_RETRIES) {
-        console.warn(`[SignManager] Retryable error: code=${code}, retrying...`);
+        _log(`[SignManager] Retryable error: code=${code}, retrying...`);
         continue;
       }
 
@@ -144,7 +147,7 @@ async function fetchToken(
         throw new Error("Sign token request timed out");
       }
       if (attempt >= MAX_RETRIES) throw err;
-      console.warn(`[SignManager] Request failed: ${err.message}, retrying...`);
+      _log(`[SignManager] Request failed: ${err.message}, retrying...`);
     }
   }
 
@@ -163,7 +166,7 @@ export async function getSignToken(
   // 缓存命中
   if (_cache && isCacheValid(_cache)) {
     const remain = Math.floor(_cache.expireTs - Date.now() / 1000);
-    console.log(`[SignManager] Using cached token (${remain}s remaining)`);
+    _log(`[SignManager] Using cached token (${remain}s remaining)`);
     return { ..._cache };
   }
 
@@ -198,7 +201,7 @@ export async function forceRefreshToken(
   apiDomain: string,
   routeEnv = "",
 ): Promise<TokenData> {
-  console.log(`[SignManager] Force refreshing token...`);
+  _log(`[SignManager] Force refreshing token...`);
   _cache = null;
   _refreshPromise = null;
   return getSignToken(appKey, appSecret, apiDomain, routeEnv);

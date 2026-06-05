@@ -167,7 +167,7 @@ export default function (pi: ExtensionAPI) {
 
   // ─── 处理元宝消息 → 转发给 Pi ───
 
-  function handleYuanbaoMessage(msg: IncomingMessage): void {
+  async function handleYuanbaoMessage(msg: IncomingMessage): Promise<void> {
     const content = msg.text?.trim();
     if (!content) return;
 
@@ -182,8 +182,23 @@ export default function (pi: ExtensionAPI) {
     // 开始发送 reply heartbeat（告诉元宝正在处理中）
     client?.startReplyHeartbeat(msg.chatId);
 
-    // 发送用户消息给 Pi
-    pi.sendUserMessage(content);
+    // 如果包含图片/文件 URL，自动下载到本地后传给 Pi
+    const mediaMatch = content.match(/\[(图片|文件[^\]]*)\]\s*(https?:\/\/\S+)/);
+    if (mediaMatch && client) {
+      flashStatus("元宝: 📥 下载资源中...");
+      const localPath = await client.downloadResource(mediaMatch[2]).catch(() => null);
+      if (localPath) {
+        // 用本地路径替换原始 URL
+        const localContent = content.replace(mediaMatch[2], localPath);
+        pi.sendUserMessage(localContent);
+      } else {
+        // 下载失败，发送原始内容
+        pi.sendUserMessage(content);
+      }
+    } else {
+      // 纯文本消息
+      pi.sendUserMessage(content);
+    }
 
     // 更新状态
     updateStatus(ctxRef, client?.getStatus() ?? "disconnected");

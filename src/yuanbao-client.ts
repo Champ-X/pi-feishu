@@ -30,8 +30,11 @@ import {
 import { getSignToken, forceRefreshToken, clearTokenCache } from "./yuanbao-sign.js";
 
 // ============================================================
-// 常量
+// 日志：console.debug 在 Pi 中仍然显示到聊天区域，改用 noop
 // ============================================================
+const _log = (..._args: any[]) => {};
+// 如需调试，取消下行注释：
+// const _log = (...args: any[]) => console.debug(...args);
 
 const DEFAULT_WS_URL = "wss://bot-wss.yuanbao.tencent.com/wss/connection";
 const DEFAULT_API_DOMAIN = "https://bot.yuanbao.tencent.com";
@@ -168,7 +171,7 @@ export class YuanbaoClient {
   /** 连接到元宝网关 */
   async connect(): Promise<boolean> {
     if (this.status === "connected" || this.status === "connecting") {
-      console.debug("[YuanbaoClient] Already connected/connecting");
+      _log("[YuanbaoClient] Already connected/connecting");
       return true;
     }
 
@@ -198,10 +201,10 @@ export class YuanbaoClient {
       if (tokenData.source) {
         this.tokenSource = tokenData.source;
       }
-      console.debug(`[YuanbaoClient] Token source: ${this.tokenSource}, bot_id: ${this.botId}`);
+      _log(`[YuanbaoClient] Token source: ${this.tokenSource}, bot_id: ${this.botId}`);
 
       // Step 2: 建立 WebSocket 连接
-      console.debug(`[YuanbaoClient] Connecting to ${this.config.wsUrl}...`);
+      _log(`[YuanbaoClient] Connecting to ${this.config.wsUrl}...`);
       this.setStatus("authenticating");
 
       this.ws = new WebSocket(this.config.wsUrl);
@@ -216,7 +219,7 @@ export class YuanbaoClient {
         }, CONNECT_TIMEOUT_MS);
 
         this.ws!.onopen = async () => {
-          console.debug("[YuanbaoClient] WebSocket connected, sending AUTH_BIND...");
+          _log("[YuanbaoClient] WebSocket connected, sending AUTH_BIND...");
           try {
             const authed = await this.authenticate(tokenData.token);
             clearTimeout(connectTimeout);
@@ -382,6 +385,112 @@ export class YuanbaoClient {
     }
   }
 
+  // ─── 资源下载 ───
+
+  /**
+   * 将元宝资源 URL 转为本地文件路径。
+   * 1. 从 URL 提取 resourceId
+   * 2. 调用 /api/resource/v1/download 获取真实下载 URL
+   * 3. 下载到 /tmp/yuanbao-media/ 并返回本地路径
+   */
+  async downloadResource(url: string): Promise<string | null> {
+    try {
+      const resourceId = this.extractResourceId(url);
+      if (!resourceId) return null;
+
+      // 获取真实下载 URL
+      const realUrl = await this.resolveResourceUrl(resourceId);
+      if (!realUrl) return null;
+
+      // 下载到本地
+      return await this.downloadToLocalFile(realUrl, resourceId);
+    } catch (err) {
+      console.error("[YuanbaoClient] downloadResource failed:", err);
+      return null;
+    }
+  }
+
+  /** 从 URL 中提取 resourceId */
+  private extractResourceId(url: string): string | null {
+    const match = url.match(/[?&]resourceId=([^&]+)/i);
+    return match?.[1] || null;
+  }
+
+  /** 调用 /api/resource/v1/download 获取真实下载 URL */
+  private async resolveResourceUrl(resourceId: string): Promise<string | null> {
+    const tokenData = await getSignToken(
+      this.config.appKey, this.config.appSecret, this.config.apiDomain, this.config.routeEnv,
+    );
+    const token = tokenData.token;
+    const source = tokenData.source || "bot";
+    const botId = tokenData.botId || this.botId;
+    if (!token || !botId) return null;
+
+    const apiUrl = `${this.config.apiDomain}/api/resource/v1/download?resourceId=${encodeURIComponent(resourceId)}`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-ID": botId,
+      "X-Token": token,
+      "X-Source": source,
+    };
+
+    const resp = await fetch(apiUrl, { headers });
+    if (!resp.ok) {
+      // 401 时强制刷新 token 重试一次
+      if (resp.status === 401) {
+        const freshToken = await forceRefreshToken(
+          this.config.appKey, this.config.appSecret, this.config.apiDomain, this.config.routeEnv,
+        );
+        headers["X-Token"] = freshToken.token;
+        headers["X-ID"] = freshToken.botId || botId;
+        const retry = await fetch(apiUrl, { headers });
+        if (!retry.ok) return null;
+        return this.parseDownloadResponse(await retry.json());
+      }
+      return null;
+    }
+    return this.parseDownloadResponse(await resp.json());
+  }
+
+  /** 解析下载 API 的响应，提取真实 URL */
+  private parseDownloadResponse(payload: any): string | null {
+    const code = payload?.code;
+    if (code !== undefined && code !== 0) return null;
+    const data = payload?.data ?? payload;
+    return data?.url || data?.realUrl || null;
+  }
+
+  /** 下载文件到本地临时目录 */
+  private async downloadToLocalFile(url: string, resourceId: string): Promise<string | null> {
+    const { mkdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const dir = "/tmp/yuanbao-media";
+    mkdirSync(dir, { recursive: true });
+
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+
+    const contentType = resp.headers.get("content-type") || "";
+    let ext = ".bin";
+    if (contentType.includes("image/jpeg")) ext = ".jpg";
+    else if (contentType.includes("image/png")) ext = ".png";
+    else if (contentType.includes("image/gif")) ext = ".gif";
+    else if (contentType.includes("image/webp")) ext = ".webp";
+    else if (contentType.includes("text/plain")) ext = ".txt";
+    else if (contentType.includes("application/json")) ext = ".json";
+    else if (contentType.includes("application/pdf")) ext = ".pdf";
+
+    const filename = `resource_${resourceId.substring(0, 12)}${ext}`;
+    const filePath = join(dir, filename);
+
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(filePath, buffer);
+
+    _log(`[YuanbaoClient] Downloaded resource to ${filePath} (${buffer.length} bytes)`);
+    return filePath;
+  }
+
   // ─── 内部方法 ───
 
   /** 发送 AUTH_BIND 并等待 BIND_ACK */
@@ -402,7 +511,7 @@ export class YuanbaoClient {
     );
 
     this.ws.send(authBytes);
-    console.debug(`[YuanbaoClient] AUTH_BIND sent (msg_id=${msgId} uid=${this.botId})`);
+    _log(`[YuanbaoClient] AUTH_BIND sent (msg_id=${msgId} uid=${this.botId})`);
 
     return new Promise<boolean>((resolve) => {
       const timeout = setTimeout(() => {
@@ -448,7 +557,7 @@ export class YuanbaoClient {
             }
 
             this.connectId = rsp.connectId;
-            console.debug(`[YuanbaoClient] BIND_ACK received: connectId=${rsp.connectId}`);
+            _log(`[YuanbaoClient] BIND_ACK received: connectId=${rsp.connectId}`);
             resolve(true);
           }
         } catch {
@@ -466,7 +575,7 @@ export class YuanbaoClient {
     try {
       msg = decodeConnMsg(raw);
     } catch (err) {
-      console.debug("[YuanbaoClient] Failed to decode frame:", err);
+      _log("[YuanbaoClient] Failed to decode frame:", err);
       return;
     }
 
@@ -502,7 +611,7 @@ export class YuanbaoClient {
         pending.resolve({ head, data });
       } else if (cmd !== CMD.AuthBind) {
         // auth-bind 响应由 authenticate() 的独立监听器处理，这里静默跳过
-        console.debug(`[YuanbaoClient] Unmatched Response: cmd=${cmd} msg_id=${msgId}`);
+        _log(`[YuanbaoClient] Unmatched Response: cmd=${cmd} msg_id=${msgId}`);
       }
       return;
     }
@@ -522,10 +631,10 @@ export class YuanbaoClient {
         this.handleInboundPush(data);
       } else if (data && data.length > 0) {
         // 其他带 data 的 push 也尝试解码（兼容未来变更）
-        console.debug(`[YuanbaoClient] Attempting to decode unknown push: cmd=${cmd}`);
+        _log(`[YuanbaoClient] Attempting to decode unknown push: cmd=${cmd}`);
         this.handleInboundPush(data);
       } else {
-        console.debug(`[YuanbaoClient] Unhandled push: cmd=${cmd}`);
+        _log(`[YuanbaoClient] Unhandled push: cmd=${cmd}`);
       }
       return;
     }
@@ -638,7 +747,7 @@ export class YuanbaoClient {
 
     // 去重
     if (push.msgId && this.dedupSet.has(push.msgId)) {
-      console.debug(`[YuanbaoClient] Duplicate message: ${push.msgId}`);
+      _log(`[YuanbaoClient] Duplicate message: ${push.msgId}`);
       return;
     }
     if (push.msgId) this.dedupSet.add(push.msgId);
@@ -649,7 +758,7 @@ export class YuanbaoClient {
     }
 
     // 仅在 debug 时输出详细信息
-    console.debug(
+    _log(
       `[YuanbaoClient] Inbound: from=${push.fromAccount.substring(0, 8)}... group=${push.groupCode} ` +
       `msg_id=${push.msgId.substring(0, 16)}... types=${push.msgBody.map((b) => b.msgType).join(",")}`
     );
@@ -707,7 +816,7 @@ export class YuanbaoClient {
     }
     const text = textParts.join("").trim();
     if (!text) {
-      console.debug("[YuanbaoClient] No extractable content in message");
+      _log("[YuanbaoClient] No extractable content in message");
       return;
     }
 
@@ -823,7 +932,7 @@ export class YuanbaoClient {
 
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 60_000);
     this.reconnectAttempts++;
-    console.debug(`[YuanbaoClient] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})...`);
+    _log(`[YuanbaoClient] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})...`);
 
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
@@ -885,7 +994,7 @@ export class YuanbaoClient {
   private setStatus(status: ClientStatus): void {
     if (this.status !== status) {
       this.status = status;
-      console.debug(`[YuanbaoClient] Status: ${status}`);
+      _log(`[YuanbaoClient] Status: ${status}`);
       for (const handler of this.statusHandlers) {
         try {
           handler(status);
