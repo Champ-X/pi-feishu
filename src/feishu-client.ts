@@ -110,8 +110,8 @@ export class FeishuClient {
     | null = null;
   private onStatusChangeCallback: ((status: BridgeStatus) => void) | null = null;
 
-  // Reaction 跟踪：chatId → 当前正在打字的消息 ID
-  private typingMessages: Map<string, string> = new Map();
+  // Reaction 跟踪：chatId → { msgId, reactionId }
+  private typingMessages: Map<string, { msgId: string; reactionId: string }> = new Map();
 
   constructor(private config: FeishuConfig) {
     const domain = config.domain === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
@@ -209,8 +209,8 @@ export class FeishuClient {
     }
 
     // 清除所有 typing reactions
-    for (const [chatId, msgId] of this.typingMessages) {
-      this.removeReaction(msgId, REACTION_TYPING).catch(() => {});
+    for (const [chatId, entry] of this.typingMessages) {
+      this.removeReactionById(entry.msgId, entry.reactionId).catch(() => {});
     }
     this.typingMessages.clear();
 
@@ -429,23 +429,25 @@ export class FeishuClient {
 
   /** 添加 typing 指示（开始处理消息时调用） */
   async startTyping(chatId: string, msgId: string): Promise<void> {
-    this.typingMessages.set(chatId, msgId);
-    await this.addReaction(msgId, REACTION_TYPING);
+    const reactionId = await this.addReaction(msgId, REACTION_TYPING);
+    if (reactionId) {
+      this.typingMessages.set(chatId, { msgId, reactionId });
+    }
   }
 
   /** 停止 typing 指示（处理完成时调用） */
   async stopTyping(chatId: string, success: boolean = true): Promise<void> {
-    const msgId = this.typingMessages.get(chatId);
-    if (!msgId) return;
+    const entry = this.typingMessages.get(chatId);
+    if (!entry) return;
 
     this.typingMessages.delete(chatId);
 
-    // 移除 Typing reaction
-    await this.removeReaction(msgId, REACTION_TYPING).catch(() => {});
+    // 移除 Typing reaction（用真实的 reaction_id）
+    await this.removeReactionById(entry.msgId, entry.reactionId).catch(() => {});
 
     // 失败时添加 CrossMark
     if (!success) {
-      await this.addReaction(msgId, REACTION_CROSS_MARK).catch(() => {});
+      await this.addReaction(entry.msgId, REACTION_CROSS_MARK).catch(() => {});
     }
   }
 
@@ -682,24 +684,30 @@ export class FeishuClient {
 
   // ─── Reaction ──────────────────────────────────────────
 
-  private async addReaction(msgId: string, emojiType: string): Promise<void> {
+  /** 添加 Reaction，返回 reaction_id（用于后续删除） */
+  private async addReaction(msgId: string, emojiType: string): Promise<string | null> {
     try {
-      await this.client.im.messageReaction.create({
+      const resp = await this.client.im.messageReaction.create({
         path: { message_id: msgId },
         data: { reaction_type: { emoji_type: emojiType } },
       });
+      const reactionId = resp?.data?.reaction_id ?? null;
+      _log(`Reaction added: ${emojiType} → ${reactionId}`);
+      return reactionId;
     } catch (err) {
       _log("Add reaction failed:", emojiType, err);
+      return null;
     }
   }
 
-  private async removeReaction(msgId: string, emojiType: string): Promise<void> {
+  /** 通过真实的 reaction_id 删除 Reaction */
+  private async removeReactionById(msgId: string, reactionId: string): Promise<void> {
     try {
       await this.client.im.messageReaction.delete({
-        path: { message_id: msgId, reaction_id: emojiType },
+        path: { message_id: msgId, reaction_id: reactionId },
       });
     } catch (err) {
-      _log("Remove reaction failed:", emojiType, err);
+      _log("Remove reaction failed:", reactionId, err);
     }
   }
 
