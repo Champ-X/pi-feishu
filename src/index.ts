@@ -122,6 +122,8 @@ interface ChatState {
   // ── 工具进度追踪 ──
   /** 进度卡片消息 ID（所有工具共用一个可编辑卡片） */
   progressMsgId: string | null;
+  /** 卡片是否正在创建中（防止竞态重复创建） */
+  progressCreating: boolean;
   /** 工具执行记录 */
   toolEntries: Array<{ name: string; status: "running" | "done" | "error" }>;
 }
@@ -248,6 +250,7 @@ export default function (pi: ExtensionAPI) {
       chatId,
       userMsgId: msgId,
       progressMsgId: null,
+      progressCreating: false,
       toolEntries: [],
     });
 
@@ -352,11 +355,21 @@ export default function (pi: ExtensionAPI) {
 
   /**
    * 构建工具进度卡片内容。
-   * 所有工具共用一条可编辑消息，显示调用历史和当前状态。
+   * 所有工具共用一条可编辑消息，只滚动保留最近 10 次操作。
    */
   function buildProgressCardContent(entries: ChatState["toolEntries"]): string {
+    const MAX_DISPLAY = 10;
+    const total = entries.length;
+    const display = total > MAX_DISPLAY ? entries.slice(-MAX_DISPLAY) : entries;
+
     const lines: string[] = [];
-    for (const entry of entries) {
+
+    // 如果有截断，显示省略提示
+    if (total > MAX_DISPLAY) {
+      lines.push(`... 前 ${total - MAX_DISPLAY} 次操作已折叠\n`);
+    }
+
+    for (const entry of display) {
       const displayName = toolDisplayName(entry.name);
       switch (entry.status) {
         case "running":
@@ -373,30 +386,46 @@ export default function (pi: ExtensionAPI) {
     return lines.join("\n");
   }
 
-  /** 创建或更新进度卡片 */
+  /** 创建或更新进度卡片（防竞态：全生命周期只创建一条消息） */
   function updateProgressCard(state: ChatState): void {
     if (!client) return;
 
     const content = buildProgressCardContent(state.toolEntries);
     const runningCount = state.toolEntries.filter((e) => e.status === "running").length;
-    const status = runningCount > 0 ? `🔧 执行中 (${runningCount})` : "🔧 工具调用";
+    const status = runningCount > 0 ? `执行中 (${runningCount})` : "工具调用";
 
     const card = FeishuClient.buildStreamingCard(content, status);
 
-    if (!state.progressMsgId) {
-      // 首次创建 — 作为用户消息的回复
-      client.sendCard(state.chatId, card, state.userMsgId).then((cardMsgId) => {
-        if (cardMsgId) {
-          state.progressMsgId = cardMsgId;
-        }
-      }).catch(() => {});
-    } else {
-      // 后续更新
+    // 情况 1: 卡片已创建 → 直接更新
+    if (state.progressMsgId) {
       client.updateCard(state.progressMsgId, card).catch(() => {
-        // 更新失败（消息被撤回等），重置以便下次重新创建
         state.progressMsgId = null;
+        state.progressCreating = false;
       });
+      return;
     }
+
+    // 情况 2: 卡片正在创建中 → 跳过，等创建完成后会自动刷新
+    if (state.progressCreating) {
+      return;
+    }
+
+    // 情况 3: 首次创建
+    state.progressCreating = true;
+    client.sendCard(state.chatId, card, state.userMsgId).then((cardMsgId) => {
+      state.progressCreating = false;
+      if (cardMsgId) {
+        state.progressMsgId = cardMsgId;
+        // 创建后立即用最新状态刷新（可能有新事件在创建期间发生）
+        const latestContent = buildProgressCardContent(state.toolEntries);
+        const latestRunning = state.toolEntries.filter((e) => e.status === "running").length;
+        const latestStatus = latestRunning > 0 ? `执行中 (${latestRunning})` : "工具调用";
+        const latestCard = FeishuClient.buildStreamingCard(latestContent, latestStatus);
+        client?.updateCard(cardMsgId, latestCard).catch(() => {});
+      }
+    }).catch(() => {
+      state.progressCreating = false;
+    });
   }
 
   // ═══════════════════════════════════════════════════════
