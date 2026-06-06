@@ -173,6 +173,26 @@ export class FeishuClient {
         appSecret: this.config.appSecret,
         domain,
         loggerLevel: Lark.LoggerLevel.info,
+        autoReconnect: true,
+        handshakeTimeoutMs: 15000,
+        wsConfig: {
+          pingTimeout: 30,
+        },
+        onReady: () => {
+          _log("WSClient: first connection established");
+        },
+        onReconnecting: () => {
+          _warn("WSClient: connection lost, reconnecting...");
+          this.setStatus("connecting");
+        },
+        onReconnected: () => {
+          _log("WSClient: reconnected successfully");
+          this.setStatus("connected");
+        },
+        onError: (err: Error) => {
+          _warn("WSClient: terminal error:", err.message);
+          this.setStatus("error");
+        },
       });
 
       this.patchCardEvents();
