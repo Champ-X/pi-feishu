@@ -225,6 +225,12 @@ export default function (pi: ExtensionAPI) {
     const content = text.trim();
     if (!content && resources.length === 0) return;
 
+    // ── 拦截斜杠命令 ──
+    if (content.startsWith("/")) {
+      await handleSlashCommand(chatId, msgId, content);
+      return;
+    }
+
     flashStatus(`飞书: 📩 ${content.substring(0, 20)}${content.length > 20 ? "..." : ""}`);
 
     // 下载入站媒体
@@ -260,6 +266,71 @@ export default function (pi: ExtensionAPI) {
     // 发送给 Pi
     const fullContent = content + (resourceDescription ? "\n" + resourceDescription : "");
     pi.sendUserMessage(fullContent);
+  }
+
+  // ─── 斜杠命令处理 ──────────────────────────────────────
+
+  /**
+   * 处理从飞书发来的斜杠命令。
+   * 这些命令不会发给 LLM，而是直接在扩展层执行或回复提示。
+   */
+  async function handleSlashCommand(
+    chatId: string,
+    msgId: string,
+    text: string,
+  ): Promise<void> {
+    const parts = text.split(/\s+/);
+    const cmd = parts[0].toLowerCase();
+    const args = parts.slice(1).join(" ");
+
+    switch (cmd) {
+      case "/compact": {
+        if (ctxRef) {
+          ctxRef.compact();
+          await client?.sendMessage(chatId, "已触发上下文压缩。", msgId);
+        } else {
+          await client?.sendMessage(chatId, "无法执行：会话上下文不可用。", msgId);
+        }
+        break;
+      }
+
+      case "/status": {
+        const status = client?.getStatus() ?? "未启动";
+        const ctxUsage = ctxRef?.getContextUsage();
+        let reply = `Pi 状态:\n- 飞书连接: ${status}\n- App ID: ${config.appId ? "****" + config.appId.slice(-4) : "未设置"}`;
+        if (ctxUsage && ctxUsage.tokens !== null) {
+          reply += `\n- 上下文: ${ctxUsage.tokens}/${ctxUsage.contextWindow} tokens (${ctxUsage.percent ?? "?"}%)`;
+        }
+        await client?.sendMessage(chatId, reply, msgId);
+        break;
+      }
+
+      case "/help": {
+        const helpText = [
+          "可用命令:",
+          "  /compact   - 压缩上下文",
+          "  /status    - 查看 Pi 状态",
+          "  /help      - 显示帮助",
+          "",
+          "以下命令请在 Pi 终端中执行（飞书不支持）:",
+          "  /new       - 新建会话",
+          "  /compact   - 压缩上下文",
+          "  /model     - 切换模型",
+          "  /tools     - 管理工具",
+        ].join("\n");
+        await client?.sendMessage(chatId, helpText, msgId);
+        break;
+      }
+
+      default: {
+        await client?.sendMessage(
+          chatId,
+          `命令 ${cmd} 不支持通过飞书执行。请在 Pi 终端中使用。`,
+          msgId,
+        );
+        break;
+      }
+    }
   }
 
   // ═══════════════════════════════════════════════════════
