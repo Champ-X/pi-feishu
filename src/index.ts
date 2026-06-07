@@ -485,18 +485,21 @@ export default function (pi: ExtensionAPI) {
     const textContent = extractTextFromMessage(message);
     if (!textContent) return;
 
+    // 标题降级
+    const processed = downgradeHeadings(textContent);
+
     // 检查这一轮是否包含工具调用
     const hasToolCalls = message.content?.some((block: any) => block.type === "toolCall");
 
     if (hasToolCalls) {
       // 中间轮：assistant 有文本 + 工具调用 → 发送中间文本（回复到用户消息）
-      const chunks = chunkText(textContent, MAX_TEXT_CHUNK);
+      const chunks = chunkText(processed, MAX_TEXT_CHUNK);
       for (const chunk of chunks) {
         client.sendMessage(state.chatId, chunk, state.userMsgId);
       }
     } else {
       // 最终轮（或无工具调用的单轮）→ 发送文本（新消息）
-      const chunks = chunkText(textContent, MAX_TEXT_CHUNK);
+      const chunks = chunkText(processed, MAX_TEXT_CHUNK);
       for (const chunk of chunks) {
         client.sendMessage(state.chatId, chunk);
       }
@@ -740,7 +743,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      await client.sendMessage(chatId, message);
+      await client.sendMessage(chatId, downgradeHeadings(message));
       return {
         content: [{ type: "text" as const, text: `已发送到飞书 [${chatId}]: ${message}` }],
         details: { sent: true, chatId, message } as Record<string, unknown>,
@@ -890,6 +893,43 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ─── 工具函数 ────────────────────────────────────────
+
+  /**
+   * Markdown 标题降级：所有出站文本的标题层级 +2，最小 H6。
+   * 规则：只处理行首 # 开头、不在代码块内的标题行。
+   *   H1 → H3, H2 → H4, H3 → H5, H4 → H6, H5/H6 → H6
+   */
+  function downgradeHeadings(text: string): string {
+    const lines = text.split("\n");
+    const result: string[] = [];
+    let inCodeBlock = false;
+
+    for (const line of lines) {
+      // 追踪代码块状态
+      if (line.startsWith("```")) {
+        inCodeBlock = !inCodeBlock;
+        result.push(line);
+        continue;
+      }
+
+      if (inCodeBlock) {
+        result.push(line);
+        continue;
+      }
+
+      // 匹配行首标题：1-6 个 # 后跟空格或行尾
+      const match = line.match(/^(#{1,6})\s/);
+      if (match) {
+        const level = match[1].length;
+        const newLevel = Math.min(level + 2, 6);
+        result.push("#".repeat(newLevel) + line.slice(level));
+      } else {
+        result.push(line);
+      }
+    }
+
+    return result.join("\n");
+  }
 
   /** 从 Pi 消息中提取文本内容 */
   function extractTextFromMessage(message: any): string | null {
