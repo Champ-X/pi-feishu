@@ -138,6 +138,23 @@ export default function (pi: ExtensionAPI) {
   /** 每个聊天独立的状态 */
   const chatStates: Map<string, ChatState> = new Map();
 
+  // ─── 消息队列 ──────────────────────────────────────────
+
+  interface QueuedMessage {
+    msgId: string;
+    text: string;
+    resources: InboundResource[];
+    chatType: "p2p" | "group";
+  }
+
+  interface ChatQueue {
+    processing: boolean;
+    queue: QueuedMessage[];
+  }
+
+  /** 每个聊天的消息队列 */
+  const chatQueues: Map<string, ChatQueue> = new Map();
+
   // ─── 注册 CLI 标志 ────────────────────────────────────
 
   pi.registerFlag("feishu-app-id", {
@@ -213,13 +230,13 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // ─── 处理飞书入站消息 → 转发给 Pi ────────────────────
+  // ─── 处理飞书入站消息 → 排队或直接处理 ────────────────
 
   async function handleFeishuMessage(
     chatId: string,
     msgId: string,
     text: string,
-    _chatType: "p2p" | "group",
+    chatType: "p2p" | "group",
     resources: InboundResource[],
   ): Promise<void> {
     const content = text.trim();
@@ -231,13 +248,47 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    flashStatus(`飞书: 📩 ${content.substring(0, 20)}${content.length > 20 ? "..." : ""}`);
+    // ── 入队 ──
+    const queue = chatQueues.get(chatId) ?? { processing: false, queue: [] };
+    chatQueues.set(chatId, queue);
+
+    queue.queue.push({ msgId, text: content, resources, chatType });
+
+    if (queue.processing) {
+      // 当前正在处理 → 通知排队
+      const pos = queue.queue.length;
+      await client?.sendMessage(
+        chatId,
+        `已排队 (前面还有 ${pos - 1} 条)`,
+        msgId,
+      );
+      flashStatus(`飞书: 📥 排队中 (${pos})`);
+      return;
+    }
+
+    // 当前空闲 → 开始处理
+    await dequeueAndProcess(chatId);
+  }
+
+  /** 从队列取出下一条消息并开始处理 */
+  async function dequeueAndProcess(chatId: string): Promise<void> {
+    const queue = chatQueues.get(chatId);
+    if (!queue || queue.queue.length === 0) {
+      // 队列空，标记空闲
+      if (queue) queue.processing = false;
+      return;
+    }
+
+    queue.processing = true;
+    const item = queue.queue.shift()!;
+
+    flashStatus(`飞书: 📩 ${item.text.substring(0, 20)}${item.text.length > 20 ? "..." : ""}`);
 
     // 下载入站媒体
     let resourceDescription = "";
-    for (const res of resources) {
+    for (const res of item.resources) {
       const localPath = await client!.downloadResource(
-        msgId,
+        item.msgId,
         res.fileKey,
         res.type,
         res.fileName,
@@ -254,17 +305,17 @@ export default function (pi: ExtensionAPI) {
     // 初始化聊天状态
     chatStates.set(chatId, {
       chatId,
-      userMsgId: msgId,
+      userMsgId: item.msgId,
       progressMsgId: null,
       progressCreating: false,
       toolEntries: [],
     });
 
     // 添加 Typing Reaction
-    await client!.startTyping(chatId, msgId);
+    await client!.startTyping(chatId, item.msgId);
 
     // 发送给 Pi
-    const fullContent = content + (resourceDescription ? "\n" + resourceDescription : "");
+    const fullContent = item.text + (resourceDescription ? "\n" + resourceDescription : "");
     pi.sendUserMessage(fullContent);
   }
 
@@ -284,6 +335,50 @@ export default function (pi: ExtensionAPI) {
     const args = parts.slice(1).join(" ");
 
     switch (cmd) {
+      case "/stop": {
+        // 中断当前处理 + 清空队列
+        const state = chatStates.get(chatId);
+        const queue = chatQueues.get(chatId);
+        const clearedCount = queue?.queue.length ?? 0;
+
+        if (state) {
+          client?.stopTyping(chatId, false).catch(() => {});
+          chatStates.delete(chatId);
+        }
+        if (queue) {
+          queue.queue = [];
+          queue.processing = false;
+        }
+
+        if (ctxRef && !ctxRef.isIdle()) {
+          ctxRef.abort();
+          await client?.sendMessage(chatId, "已中断当前处理，队列已清空。", msgId);
+        } else if (clearedCount > 0) {
+          await client?.sendMessage(chatId, `已清空 ${clearedCount} 条排队消息。`, msgId);
+        } else {
+          await client?.sendMessage(chatId, "当前没有正在处理的任务。", msgId);
+        }
+        break;
+      }
+
+      case "/queue": {
+        const queue = chatQueues.get(chatId);
+        const state = chatStates.get(chatId);
+        const count = queue?.queue.length ?? 0;
+        const idle = ctxRef?.isIdle() ?? true;
+
+        if (!state && count === 0) {
+          await client?.sendMessage(chatId, "队列为空，当前空闲。", msgId);
+        } else {
+          let reply = idle ? "状态: 空闲" : "状态: 处理中";
+          if (count > 0) {
+            reply += `\n排队中: ${count} 条消息`;
+          }
+          await client?.sendMessage(chatId, reply, msgId);
+        }
+        break;
+      }
+
       case "/compact": {
         if (ctxRef) {
           ctxRef.compact();
@@ -297,9 +392,13 @@ export default function (pi: ExtensionAPI) {
       case "/status": {
         const status = client?.getStatus() ?? "未启动";
         const ctxUsage = ctxRef?.getContextUsage();
+        const queue = chatQueues.get(chatId);
         let reply = `Pi 状态:\n- 飞书连接: ${status}\n- App ID: ${config.appId ? "****" + config.appId.slice(-4) : "未设置"}`;
         if (ctxUsage && ctxUsage.tokens !== null) {
           reply += `\n- 上下文: ${ctxUsage.tokens}/${ctxUsage.contextWindow} tokens (${ctxUsage.percent ?? "?"}%)`;
+        }
+        if (queue && queue.queue.length > 0) {
+          reply += `\n- 排队: ${queue.queue.length} 条`;
         }
         await client?.sendMessage(chatId, reply, msgId);
         break;
@@ -308,13 +407,14 @@ export default function (pi: ExtensionAPI) {
       case "/help": {
         const helpText = [
           "可用命令:",
+          "  /stop      - 中断当前处理，清空排队",
+          "  /queue     - 查看排队状态",
           "  /compact   - 压缩上下文",
           "  /status    - 查看 Pi 状态",
           "  /help      - 显示帮助",
           "",
-          "以下命令请在 Pi 终端中执行（飞书不支持）:",
+          "以下命令请在 Pi 终端中执行:",
           "  /new       - 新建会话",
-          "  /compact   - 压缩上下文",
           "  /model     - 切换模型",
           "  /tools     - 管理工具",
         ].join("\n");
@@ -405,19 +505,33 @@ export default function (pi: ExtensionAPI) {
     flashStatus(`飞书: 📤 推送中 (${textContent.length}字)`);
   });
 
-  // ─── agent_end → 清理 ────────────────────────────────
+  // ─── agent_end → 清理 + 处理下一条排队消息 ──────────
 
   pi.on("agent_end", (_event: AgentEndEvent) => {
     if (!client || client.getStatus() !== "connected") return;
     const state = findActiveState();
     if (!state) return;
 
-    // 移除 Typing Reaction
-    client.stopTyping(state.chatId, true).catch(() => {});
+    const chatId = state.chatId;
 
-    // 清理状态
-    chatStates.delete(state.chatId);
-    flashStatus("飞书: ✅ 完成");
+    // 移除 Typing Reaction
+    client.stopTyping(chatId, true).catch(() => {});
+
+    // 清理当前状态
+    chatStates.delete(chatId);
+
+    // 处理队列中的下一条消息
+    const queue = chatQueues.get(chatId);
+    if (queue && queue.queue.length > 0) {
+      flashStatus("飞书: 处理下一条...");
+      // 异步处理下一条，不阻塞
+      dequeueAndProcess(chatId).catch(() => {
+        queue.processing = false;
+      });
+    } else {
+      if (queue) queue.processing = false;
+      flashStatus("飞书: ✅ 完成");
+    }
   });
 
   // ═══════════════════════════════════════════════════════
