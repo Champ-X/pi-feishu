@@ -245,20 +245,21 @@ export class FeishuClient {
 
   // ─── 消息发送 ──────────────────────────────────────────
 
-  /** 发送文本消息到飞书（回复模式优先） */
+  /** 发送文本消息到飞书（回复模式优先，使用 interactive 卡片格式） */
   async sendMessage(chatId: string, text: string, replyToMsgId?: string): Promise<void> {
-    const content = this.buildPostContent(text);
+    const card = FeishuClient.buildTextCard(text);
+    const content = JSON.stringify(card);
 
     try {
       if (replyToMsgId) {
         await this.client.im.message.reply({
           path: { message_id: replyToMsgId },
-          data: { content, msg_type: "post" },
+          data: { content, msg_type: "interactive" },
         });
       } else {
         await this.client.im.message.create({
           params: { receive_id_type: "chat_id" },
-          data: { receive_id: chatId, content, msg_type: "post" },
+          data: { receive_id: chatId, content, msg_type: "interactive" },
         });
       }
       _log(`Message sent to ${chatId}${replyToMsgId ? ` (reply to ${replyToMsgId})` : ""}`);
@@ -267,7 +268,7 @@ export class FeishuClient {
         _warn("Reply failed (message withdrawn), falling back to create");
         await this.client.im.message.create({
           params: { receive_id_type: "chat_id" },
-          data: { receive_id: chatId, content, msg_type: "post" },
+          data: { receive_id: chatId, content, msg_type: "interactive" },
         });
       } else {
         throw err;
@@ -656,16 +657,21 @@ export class FeishuClient {
     return result;
   }
 
-  /** 构建 post 格式消息内容 */
-  private buildPostContent(text: string): string {
-    return JSON.stringify({
-      zh_cn: {
-        content: [[{ tag: "md", text }]],
-      },
-    });
-  }
-
   // ─── 交互卡片构建 ──────────────────────────────────────
+
+  /** 构建纯文本卡片（用于普通消息回复） */
+  static buildTextCard(text: string): Record<string, unknown> {
+    const safeText = text.length > 3500 ? text.substring(0, 3500) + "\n..." : text;
+    return {
+      config: { wide_screen_mode: true },
+      elements: [
+        {
+          tag: "div",
+          text: { tag: "lark_md", content: safeText },
+        },
+      ],
+    };
+  }
 
   /** 构建一个简单的流式更新卡片（v1 格式） */
   static buildStreamingCard(text: string, status?: string): Record<string, unknown> {
