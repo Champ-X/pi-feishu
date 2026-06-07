@@ -659,58 +659,44 @@ export class FeishuClient {
 
   // ─── 交互卡片构建 ──────────────────────────────────────
 
-  /** 构建纯文本卡片（用于普通消息回复） */
-  static buildTextCard(text: string): Record<string, unknown> {
-    const safeText = text.length > 3500 ? text.substring(0, 3500) + "\n..." : text;
+  /** v2 卡片外壳 */
+  private static v2Card(elements: Record<string, unknown>[]): Record<string, unknown> {
     return {
-      config: { wide_screen_mode: true },
-      elements: [
-        {
-          tag: "div",
-          text: { tag: "lark_md", content: safeText },
-        },
-      ],
+      schema: "2.0",
+      body: { elements },
     };
   }
 
-  /** 构建一个简单的流式更新卡片（v1 格式） */
+  /** 截断过长文本 */
+  private static safeText(text: string, limit = 3500): string {
+    return text.length > limit ? text.substring(0, limit) + "\n..." : text;
+  }
+
+  /** 构建纯文本卡片（用于普通消息回复，支持完整 Markdown） */
+  static buildTextCard(text: string): Record<string, unknown> {
+    return FeishuClient.v2Card([
+      { tag: "markdown", content: FeishuClient.safeText(text) },
+    ]);
+  }
+
+  /** 构建流式更新卡片（状态行 + 内容，支持完整 Markdown） */
   static buildStreamingCard(text: string, status?: string): Record<string, unknown> {
     const elements: Record<string, unknown>[] = [];
 
     if (status) {
-      elements.push({
-        tag: "div",
-        text: { tag: "lark_md", content: `**${status}**` },
-      });
+      elements.push({ tag: "markdown", content: `**${status}**` });
     }
 
-    // 截断过长文本，避免卡片内容超限
-    const safeText = text.length > 3500 ? text.substring(0, 3500) + "\n..." : text;
+    elements.push({ tag: "markdown", content: FeishuClient.safeText(text) });
 
-    elements.push({
-      tag: "div",
-      text: { tag: "lark_md", content: safeText },
-    });
-
-    return {
-      config: { wide_screen_mode: true },
-      elements,
-    };
+    return FeishuClient.v2Card(elements);
   }
 
-  /** 构建完成态卡片 */
+  /** 构建完成态卡片（支持完整 Markdown） */
   static buildFinalCard(text: string): Record<string, unknown> {
-    const safeText = text.length > 3500 ? text.substring(0, 3500) + "\n..." : text;
-
-    return {
-      config: { wide_screen_mode: true },
-      elements: [
-        {
-          tag: "div",
-          text: { tag: "lark_md", content: safeText },
-        },
-      ],
-    };
+    return FeishuClient.v2Card([
+      { tag: "markdown", content: FeishuClient.safeText(text) },
+    ]);
   }
 
   // ─── Reaction ──────────────────────────────────────────
