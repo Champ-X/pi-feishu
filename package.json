@@ -5,6 +5,14 @@
   "type": "module",
   "main": "src/index.ts",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/surenkid/pi-feishu.git"
+  },
+  "homepage": "https://github.com/surenkid/pi-feishu",
+  "bugs": {
+    "url": "https://github.com/surenkid/pi-feishu/issues"
+  },
   "keywords": [
     "pi-package",
     "pi",
