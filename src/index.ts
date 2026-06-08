@@ -335,6 +335,35 @@ export default function (pi: ExtensionAPI) {
     const args = parts.slice(1).join(" ");
 
     switch (cmd) {
+      case "/new": {
+        // 清空飞书侧状态
+        const state = chatStates.get(chatId);
+        const queue = chatQueues.get(chatId);
+
+        if (state) {
+          client?.stopTyping(chatId, false).catch(() => {});
+          chatStates.delete(chatId);
+        }
+        if (queue) {
+          queue.queue = [];
+          queue.processing = false;
+        }
+
+        // 中断当前处理
+        if (ctxRef && !ctxRef.isIdle()) {
+          ctxRef.abort();
+        }
+
+        // 压缩上下文清除历史
+        if (ctxRef) {
+          ctxRef.compact();
+          await client?.sendMessage(chatId, "会话已重置，上下文已清空。", msgId);
+        } else {
+          await client?.sendMessage(chatId, "无法重置：会话上下文不可用。", msgId);
+        }
+        break;
+      }
+
       case "/stop": {
         // 中断当前处理 + 清空队列
         const state = chatStates.get(chatId);
@@ -407,6 +436,7 @@ export default function (pi: ExtensionAPI) {
       case "/help": {
         const helpText = [
           "可用命令:",
+          "  /new       - 新建会话（重置上下文）",
           "  /stop      - 中断当前处理，清空排队",
           "  /queue     - 查看排队状态",
           "  /compact   - 压缩上下文",
@@ -414,7 +444,6 @@ export default function (pi: ExtensionAPI) {
           "  /help      - 显示帮助",
           "",
           "以下命令请在 Pi 终端中执行:",
-          "  /new       - 新建会话",
           "  /model     - 切换模型",
           "  /tools     - 管理工具",
         ].join("\n");
