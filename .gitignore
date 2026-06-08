@@ -11,3 +11,6 @@ dist/
 
 # Reference materials (not part of the package)
 reference/
+
+# Development docs (not part of the package)
+docs/
