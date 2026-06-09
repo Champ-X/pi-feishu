@@ -517,6 +517,15 @@ export default function (pi: ExtensionAPI) {
     const message = event.message;
     if (!message || message.role !== "assistant") return;
 
+    // ── 检测 LLM 错误 ──
+    if (message.stopReason === "error") {
+      const errMsg = message.errorMessage ?? "LLM 返回了未知错误";
+      client.sendMessage(state.chatId, `LLM 错误: ${errMsg}`, state.userMsgId).catch(() => {});
+      client.stopTyping(state.chatId, false).catch(() => {});
+      flashStatus("飞书: ⚠️ LLM 错误");
+      return;
+    }
+
     const textContent = extractTextFromMessage(message);
     if (!textContent) return;
 
