@@ -279,6 +279,12 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Pi 正忙（压缩中/流式中）→ 不出队，保持 processing=false 等空闲时再触发
+    if (ctxRef && !ctxRef.isIdle()) {
+      queue.processing = false;
+      return;
+    }
+
     queue.processing = true;
     const item = queue.queue.shift()!;
 
@@ -552,18 +558,36 @@ export default function (pi: ExtensionAPI) {
     // 清理当前状态
     chatStates.delete(chatId);
 
-    // 处理队列中的下一条消息
+    // 刷新所有队列（包括当前聊天）
     const queue = chatQueues.get(chatId);
-    if (queue && queue.queue.length > 0) {
-      flashStatus("飞书: 处理下一条...");
-      // 异步处理下一条，不阻塞
-      dequeueAndProcess(chatId).catch(() => {
-        queue.processing = false;
-      });
-    } else {
-      if (queue) queue.processing = false;
-      flashStatus("飞书: ✅ 完成");
+    if (queue) queue.processing = false;
+    flushAllQueues();
+    flashStatus("飞书: ✅ 完成");
+  });
+
+  // ─── Pi 空闲时刷新所有队列 ─────────────────────────────
+
+  /**
+   * 检查所有聊天的队列，Pi 空闲时尝试处理下一条。
+   * 在 agent_end、session_compact、session_start 后调用。
+   */
+  function flushAllQueues(): void {
+    if (!client || client.getStatus() !== "connected") return;
+    if (ctxRef && !ctxRef.isIdle()) return;
+
+    for (const [chatId, queue] of chatQueues) {
+      if (!queue.processing && queue.queue.length > 0) {
+        dequeueAndProcess(chatId).catch(() => {
+          queue.processing = false;
+        });
+      }
     }
+  }
+
+  // 压缩完成后，刷新队列（可能有积压消息）
+  pi.on("session_compact", async () => {
+    // 延迟一小段，等 Pi 完全恢复空闲
+    setTimeout(() => flushAllQueues(), 500);
   });
 
   // ═══════════════════════════════════════════════════════
@@ -911,6 +935,9 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`飞书连接失败: ${err}`, "error");
       }
     }
+
+    // 启动后刷新积压的队列
+    flushAllQueues();
   });
 
   pi.on("session_shutdown", async () => {
